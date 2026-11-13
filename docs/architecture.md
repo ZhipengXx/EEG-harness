@@ -1,85 +1,82 @@
 # Architecture and source map
 
-Inspection baseline: [`09dc98f83e8e4aa944245cfeb661d87e4af2e170`](https://github.com/ZhipengXx/EEG-harness/tree/09dc98f83e8e4aa944245cfeb661d87e4af2e170), committed on 2026-10-04 (UTC+08:00). This map includes next-action comparisons, verified artifact reads, bound audit feedback and execution recovery. See the [running guide](running.md) for setup and the [platform gallery](platform.md) for recorded UI images.
+EEG-harness coordinates a research campaign through explicit tasks, candidate implementations, measurements and memory. This page describes the current `single_plan_v1` path and links each responsibility to its source. See [running a campaign](running.md) for commands.
 
-## Reading the figures
+## Research flow
 
-The visual system uses warm paper, ink blue, muted teal and copper. Dark bullet labels identify LLM roles; teal text identifies runtime responsibilities or study context. Copper arrows show representative forward handoffs; dashed arrows show conditional paths, repairs, feedback or scoped-memory retrieval. Color is paired with text labels.
+![The current research loop](figures/02-eeg-agent-collaboration.png)
 
-Arrows represent semantic handoffs mediated by the runtime. They do not imply direct role-to-role messages, separate services, mandatory invocation order, or parallel execution. The overview separates the two studies; the EEG figure groups roles into four research stages with conditional feedback, and the fMRI figure shows the check-and-observe loop. Brain shapes, activity colors, signal traces, representation tiles and image glyphs are conceptual drawings, not anatomical maps, measured data or benchmark results.
+1. **Planner** proposes 2–4 alternatives from the question, current results and retrieved evidence.
+2. **Critic** compares the complete pool and selects one original plan. It shares Planner's paper context and can retrieve additional experiment history matched to the proposals.
+3. The runtime dispatches the selected task. **New methods** go through Designer → Coder / Reviewer → training. **Validation and confirmation** measure an existing implementation; **diagnosis** runs the requested diagnostics and analyzes their evidence. These branches skip design and coding.
+4. **Measurement** binds results to the task and evaluation scope. **Analyst** interprets the measured comparison and diagnostics.
+5. Local code records an **ExperimentObservation** containing measured facts, analysis and limitations. The next Planner can retrieve it. Paid Auditor / Curator maintenance is optional and defaults to `off` for single-plan execution.
 
-## System overview
+Normal proposal and selection use two API calls, apart from corrections or retries. Optional paper initialization is separate. Training, deterministic measurement checks, observation assembly and local retrieval are not additional model-review stages.
 
-![System overview](figures/01-system-overview.png)
+## Context belongs to the stage
 
-| Figure element | Implementation | Boundary |
+| Stage | Input needed for the task | Main output |
 | --- | --- | --- |
-| Workbench and controls | [`fmri/workbench.py`](../react-agent/src/react_agent/fmri/workbench.py) and workflow CLIs | A shared interface does not merge workflow evidence or memory |
-| fMRI loop | [`fmri/graph.py`](../react-agent/src/react_agent/fmri/graph.py), [`fmri/loop.py`](../react-agent/src/react_agent/fmri/loop.py) | Numeric-consistency screening |
-| Image materialization | [`fmri/pipeline_graph.py`](../react-agent/src/react_agent/fmri/pipeline_graph.py), [`fmri/generation/`](../react-agent/src/react_agent/fmri/generation/) | External TRIBE resources; optional generation before screening |
-| EEG campaign | [`agentic/loop.py`](../react-agent/src/react_agent/eeg_research/agentic/loop.py), [`agentic/worker.py`](../react-agent/src/react_agent/eeg_research/agentic/worker.py) | State-driven actions and service calls |
-| ReAct entry | [`graph.py`](../react-agent/src/react_agent/graph.py) | Conversation graph |
-| Studio adapters | [`langgraph.json`](../react-agent/langgraph.json), [`studio_graph.py`](../react-agent/src/react_agent/eeg_research/agentic/studio_graph.py) | EEG view wraps ticks as load → step → summarize |
+| Planner | Research question, current evidence, selected experiment history and paper findings | Alternative tasks with scientific intent and expected observations |
+| Critic | Proposal pool, shared planning evidence and proposal-specific experiment matches | Selected proposal and comparison rationale |
+| Designer | Selected task, locally resolved current fold setting, parent source/configuration and supported interfaces | Design brief and implementation requirements |
+| Coder / Reviewer | Approved design, source and interfaces, current implementation feedback | Candidate implementation and implementation review |
+| Analyst | Bound experiment specification, native measured results, aggregate comparison and training diagnostics | Scientific interpretation, limitations and follow-up suggestions |
+| Observation assembly | Accepted analysis plus native experiment facts and source identities | Persistent experiment-memory record |
 
-## EEG role collaboration
+Designer does not receive the general retrieved-history bundle, Critic selection bookkeeping or baseline diagnostic history. Local code embeds the current task's fold scope and completion condition, so downstream stages use the current experiment setting rather than guessing from the overall research goal.
 
-![EEG collaboration](figures/02-eeg-agent-collaboration.png)
+The models supply scientific judgments and code. Local code supplies identities, protocol settings, measured metric values, source bindings and record assembly. Prompt projection keeps internal validation and recovery records out of the scientific input.
 
-`single_plan_v1` campaigns always use `research_execution.planning_mode: propose_then_critic`. In one call the Planner proposes a batch of distinct plans (`target_k` defaults to 3, configurable from 2–4). The runtime validates the pool; one separate Critic call receives all valid plans and shared research context, compares their scientific value, history, feasibility and costs, and selects one original plan. Only the selected plan, selection rationale and relevant memory basis reach the Designer. The two roles can use the same thinking model with separate prompts and contexts. Normal planning takes two API calls, excluding corrections. Planner, Critic, Designer, Coder, Reviewer and Analyst each have one current (v2) stage contract with no older fallback. This separation alone does not establish an accuracy or speed gain.
+## Source map
 
-Legacy action planning uses the separate `planner_mode` field. The planner receives current observations and `available_actions()` derives executable choices from state and budget. In `compare_options` mode the prompt asks for 2–4 materially different action-target options in one call, and the schema permits at most four. One option is allowed when only one is reasonable. The same response records `options`, `selected_option_id` and `selection_rationale`; selected action / target / question and evidence references must match the top-level decision. `tick()` reconciles work, checks the latest gates and routes that selection through the appropriate service. Job settlement and analysis can occur without an extra planner decision; legacy campaigns can retain `single_action` mode.
+The links below point to the implementation files in this checkout.
 
-The [planning illustration](figures/04-planning-options.png) depicts this comparison and selection. Its options are research actions, which can include a candidate experiment, diagnostic or evidence read. It does not prescribe a fixed number of new model candidates or training jobs.
+| Responsibility | Implementation |
+| --- | --- |
+| Campaign control and selected-task dispatch | [`agentic/cli.py`](../react-agent/src/react_agent/eeg_research/agentic/cli.py), [`selected_plan.py`](../react-agent/src/react_agent/eeg_research/agentic/selected_plan.py), [`worker.py`](../react-agent/src/react_agent/eeg_research/agentic/worker.py) |
+| Proposal and Critic selection | [`staged_planning.py`](../react-agent/src/react_agent/eeg_research/agentic/staged_planning.py), [`planning_context.py`](../react-agent/src/react_agent/eeg_research/agentic/planning_context.py), [`planning_contract.py`](../react-agent/src/react_agent/eeg_research/agentic/planning_contract.py), [`critic_contract.py`](../react-agent/src/react_agent/eeg_research/agentic/critic_contract.py) |
+| Design input and local assembly | [`designer_context.py`](../react-agent/src/react_agent/eeg_research/agentic/designer_context.py), [`designer_contract.py`](../react-agent/src/react_agent/eeg_research/agentic/designer_contract.py) |
+| Coding and implementation review | [`coder.py`](../react-agent/src/react_agent/eeg_research/agentic/coder.py), [`coder_context.py`](../react-agent/src/react_agent/eeg_research/agentic/coder_context.py), [`reviewer_context.py`](../react-agent/src/react_agent/eeg_research/agentic/reviewer_context.py), [`reviewer_contract.py`](../react-agent/src/react_agent/eeg_research/agentic/reviewer_contract.py) |
+| Experiment binding and measurement | [`run_context.py`](../react-agent/src/react_agent/eeg_research/agentic/run_context.py), [`method_suite.py`](../react-agent/src/react_agent/eeg_research/agentic/method_suite.py), [`comparison.py`](../react-agent/src/react_agent/eeg_research/agentic/comparison.py), [`stage_reviews.py`](../react-agent/src/react_agent/eeg_research/agentic/stage_reviews.py) |
+| Training recipe and candidate hooks | [`eeg_training/protocol.py`](../react-agent/src/react_agent/eeg_training/protocol.py), [`hooks.py`](../react-agent/src/react_agent/eeg_training/hooks.py), [`train_entry.py`](../react-agent/src/react_agent/eeg_training/train_entry.py) |
+| Analysis inputs and response | [`analysis_context.py`](../react-agent/src/react_agent/eeg_research/agentic/analysis_context.py), [`analysis_contract.py`](../react-agent/src/react_agent/eeg_research/agentic/analysis_contract.py), [`measurement_context.py`](../react-agent/src/react_agent/eeg_research/agentic/measurement_context.py) |
+| Experiment observations and retrieval | [`experiment_observations.py`](../react-agent/src/react_agent/eeg_research/agentic/experiment_observations.py), [`semantic_memory.py`](../react-agent/src/react_agent/eeg_research/agentic/semantic_memory.py), [`memory_delivery.py`](../react-agent/src/react_agent/eeg_research/agentic/memory_delivery.py) |
+| Paper acquisition, extraction and retrieval | [`literature_sources.py`](../react-agent/src/react_agent/eeg_research/agentic/literature_sources.py), [`literature_bootstrap.py`](../react-agent/src/react_agent/eeg_research/agentic/literature_bootstrap.py), [`literature_contract.py`](../react-agent/src/react_agent/eeg_research/agentic/literature_contract.py), [`literature_memory.py`](../react-agent/src/react_agent/eeg_research/agentic/literature_memory.py) |
+| Model routing, requests and recovery | [`role_config.py`](../react-agent/src/react_agent/eeg_research/agentic/role_config.py), [`llm.py`](../react-agent/src/react_agent/eeg_research/agentic/llm.py), [`staged_planning_recovery.py`](../react-agent/src/react_agent/eeg_research/agentic/staged_planning_recovery.py) |
+| Optional paid maintenance | [`research_execution.py`](../react-agent/src/react_agent/eeg_research/agentic/research_execution.py), [`loop.py`](../react-agent/src/react_agent/eeg_research/agentic/loop.py), [`audit_context.py`](../react-agent/src/react_agent/eeg_research/agentic/audit_context.py), [`memory.py`](../react-agent/src/react_agent/eeg_research/agentic/memory.py) |
 
-| Responsibility | Source | Output / enforcement |
-| --- | --- | --- |
-| Planning | [`planner.py`](../react-agent/src/react_agent/eeg_research/agentic/planner.py), [`research_plan.py`](../react-agent/src/react_agent/eeg_research/agentic/research_plan.py) | Legal action comparisons, selected option and evidence-linked plan versions; bounded schema correction |
-| Research plan proposal and comparison | [`staged_planning.py`](../react-agent/src/react_agent/eeg_research/agentic/staged_planning.py), [`planning_context.py`](../react-agent/src/react_agent/eeg_research/agentic/planning_context.py), [`plan_protocol.py`](../react-agent/src/react_agent/eeg_research/agentic/plan_protocol.py) | Separate multi-plan proposal and Critic selection; scientific prompt views are separate from native validation and recovery records |
-| Selected evidence reads | [`handoffs.py`](../react-agent/src/react_agent/eeg_research/agentic/handoffs.py), [`artifacts.py`](../react-agent/src/react_agent/eeg_research/agentic/artifacts.py) | Verified development-artifact pages, read budgets, selected role context and consumer delivery records |
-| Local method retrieval | [`knowledge/__init__.py`](../react-agent/src/react_agent/eeg_research/agentic/knowledge/__init__.py), [`loop.py`](../react-agent/src/react_agent/eeg_research/agentic/loop.py) `_retrieve_methods` | Local cards and optional librarian interpretation; no online search |
-| Experiment design | [`loop.py`](../react-agent/src/react_agent/eeg_research/agentic/loop.py) `_design_experiment`, [`experiment_designer.txt`](../react-agent/src/react_agent/eeg_research/agentic/prompts/experiment_designer.txt) | Draft with control, intervention, capabilities and evidence |
-| Runtime approval | [`experiment_gate.py`](../react-agent/src/react_agent/eeg_research/agentic/experiment_gate.py), [`run_context.py`](../react-agent/src/react_agent/eeg_research/agentic/run_context.py) | Context-bound approval and frozen run specifications |
-| Candidate implementation and review | [`native_patch.py`](../react-agent/src/react_agent/eeg_research/agentic/native_patch.py), [`worker.py`](../react-agent/src/react_agent/eeg_research/agentic/worker.py) | Controlled edits, checks, verdicts and bounded repairs |
-| Training | [`jobs.py`](../react-agent/src/react_agent/eeg_research/agentic/jobs.py), [`train_entry.py`](../react-agent/src/react_agent/eeg_training/train_entry.py) | Training/evaluation artifacts and checkpoints |
-| Evidence settlement | [`loop.py`](../react-agent/src/react_agent/eeg_research/agentic/loop.py) `_record_job`, [`comparison.py`](../react-agent/src/react_agent/eeg_research/agentic/comparison.py) | Result binding, diagnostics and matched comparison |
-| Result analysis | [`worker.py`](../react-agent/src/react_agent/eeg_research/agentic/worker.py) `analyze`, [`measurement_context.py`](../react-agent/src/react_agent/eeg_research/agentic/measurement_context.py), [`result_analyst.txt`](../react-agent/src/react_agent/eeg_research/agentic/prompts/result_analyst.txt) | Bound hypothesis, source / run diagnostics, frozen evaluation population and measured parameter counts |
-| Result audit and corrections | [`loop.py`](../react-agent/src/react_agent/eeg_research/agentic/loop.py) `_audit_result`, [`audit_context.py`](../react-agent/src/react_agent/eeg_research/agentic/audit_context.py) | Structured report / dependency context, audit identity and freshness, per-issue corrections and explicit re-audit closure |
-| Research progress and recovery | [`research_progress.py`](../react-agent/src/react_agent/eeg_research/agentic/research_progress.py), [`development_feedback.py`](../react-agent/src/react_agent/eeg_research/agentic/development_feedback.py), [`loop.py`](../react-agent/src/react_agent/eeg_research/agentic/loop.py) | Source-bound comparison gaps, development feedback and recovery of persisted decision / read batches |
-| Memory and evidence level | [`memory.py`](../react-agent/src/react_agent/eeg_research/agentic/memory.py), [`promotion.py`](../react-agent/src/react_agent/eeg_research/agentic/promotion.py) | Accepted conditional lessons and runtime promotion decisions |
-| Pack reuse | [`export.py`](../react-agent/src/react_agent/eeg_research/agentic/export.py) | Hashes, source availability and evaluate-only reconstruction command |
+The training recipe can vary learning rate, epochs, batch size and weight decay. The image target still uses precomputed RN50 features; image-backbone replacement or fine-tuning is not part of the current execution interface. Fold selection, gallery and metric definitions remain explicit parts of the evaluation protocol.
 
-The eight base role prompts live in [`agentic/prompts/`](../react-agent/src/react_agent/eeg_research/agentic/prompts/); the staged research proposer and independent Critic use [`prompts/runtime_v1/`](../react-agent/src/react_agent/eeg_research/agentic/prompts/runtime_v1/). [`role_config.py`](../react-agent/src/react_agent/eeg_research/agentic/role_config.py) resolves independent EEG model, thinking/effort, output and deadline settings before task-cache lookup, including the Critic when enabled. The actual DeepSeek request and ledger carry this configuration; shared fMRI defaults retain their earlier semantics. [`roles.py`](../react-agent/src/react_agent/eeg_research/agentic/roles.py), [`task_ledger.py`](../react-agent/src/react_agent/eeg_research/agentic/task_ledger.py), [`identity.py`](../react-agent/src/react_agent/eeg_research/agentic/identity.py) and [`artifacts.py`](../react-agent/src/react_agent/eeg_research/agentic/artifacts.py) maintain result envelopes, task/attempt identity and provenance.
+## Prompts and role configuration
 
-With explicit `action_planning`, the Planner proposal envelope preserves raw options for individual schema and runtime validation. Its valid pool supplies the complete selected action payload. Bad drafts remain in the trace; raw and normalized execution hashes are separate. Candidate admission and detach receipts survive recovery, and a failed branch never returns its spent method slot. Coding recovery uses candidate-local step/error/upgrade counters; switching model or attempt preserves consumed limits.
+Current Planner, Critic, Designer, Coder, Reviewer and Analyst prompts live in [`prompts/runtime_v2/`](../react-agent/src/react_agent/eeg_research/agentic/prompts/runtime_v2/). That directory also contains the literature query-planner and reader prompts. [`llm.py`](../react-agent/src/react_agent/eeg_research/agentic/llm.py) selects and assembles the role request.
 
-The opt-in `screen_then_confirm` schedule freezes ten LOSO folds and a two-fold selection before training. Screening and confirmation share one method suite and recipe. Only valid matched two-fold results may grant screening feedback; promotion separately checks budget and resources for all missing candidate and baseline folds. Ten valid unique folds remain necessary for the full development mean. [The schedule guide](screen-then-confirm.md) describes scope, commands, replay boundaries and compatibility.
+[`prompts/runtime_v1/`](../react-agent/src/react_agent/eeg_research/agentic/prompts/runtime_v1/) still supplies supporting-role missions and implementation cases; it is not an alternate version of the current stage flow. [`runtime_prompts.py`](../react-agent/src/react_agent/eeg_research/agentic/runtime_prompts.py) selects those targeted hints. The role registry contains nine core roles, including Critic, and two optional literature roles. A role's existence does not mean it runs in every iteration.
 
-The capability manifest declares hooks, but `available` is not a verification receipt: the current manifest initially marks verification as false. The approval gate checks registered availability; it does not require a non-null verification artifact for each hook. Unknown or disabled hooks can block approval. Candidate changes must respect the frozen contract and executable hooks.
+## Two memory stores
 
-The `_audit_result` service constructs a development-scoped report draft, verified analysis views and a dependency manifest containing hashes and filtered payloads from recorded run artifacts. It passes that context, exact report identities and prior audit feedback to the auditor. Reusable feedback must match the report reference, report hash, manifest hash and current dependency snapshot. Invalid, partial, legacy or stale feedback remains limited evidence. A deterministic integrity failure cannot be overridden by a model's PASS verdict.
+Paper memory retains extracted findings and their paper sources under `literature_memory/`. Experiment memory retains observations from the current campaign under `experiment_observations/`, with local indexing for retrieval. They use separate content budgets; one does not consume the other's allowance.
 
-Audit corrections are tracked as individual issues. A correction action does not itself close an issue: a later bound audit must cover its resolution with evidence or a verified claim withdrawal / narrowing. Selected artifact reads elsewhere in the loop verify registered content and page identity, preserve bounded context and record delivery to a consumer request. These controls do not establish independent replication or prove that an LLM inspected every underlying file.
-
-A pilot need not lead to a full run. Full runs need not improve performance. Confirmation and stopping depend on evidence, budget and policy. Valid negative findings can be retained and audited.
+Planner receives the current and relevant experiment observations plus selected paper findings. Critic reuses paper findings and can extend the experiment context with matches for each proposed method. Later stage inputs are assembled from the selected task and the stage's own artifacts. The detailed configuration and maintenance commands are in the [runtime README](../react-agent/README.md).
 
 ## fMRI screening collaboration
 
-![fMRI screening](figures/03-fmri-screening-loop.png)
+The [workbench](../react-agent/src/react_agent/fmri/workbench.py) provides a shared interface for research and fMRI screening. The workflows retain separate protocols, state and memory.
 
-| Responsibility | Source | Output / enforcement |
-| --- | --- | --- |
-| Ingest and required checks | [`graph.py`](../react-agent/src/react_agent/fmri/graph.py), [`loop.py`](../react-agent/src/react_agent/fmri/loop.py) | Mandatory-check results before optional selection |
-| Planner / replanner | [`planning/service.py`](../react-agent/src/react_agent/fmri/planning/service.py) | Structured plan proposals |
-| Action validation | [`planning/validator.py`](../react-agent/src/react_agent/fmri/planning/validator.py), [`policy.py`](../react-agent/src/react_agent/fmri/policy.py), [`planning/guards.py`](../react-agent/src/react_agent/fmri/planning/guards.py) | Tool, resource, budget and policy constraints |
-| Tools and evidence | [`tools/registry.py`](../react-agent/src/react_agent/fmri/tools/registry.py), [`ledger.py`](../react-agent/src/react_agent/fmri/ledger.py) | Measurements and question coverage |
-| Diagnostic stopping | [`diagnostic/stop_gate.py`](../react-agent/src/react_agent/fmri/diagnostic/stop_gate.py) | Diagnostic-mode stopping within its contract |
-| Final report | [`reporting.py`](../react-agent/src/react_agent/fmri/reporting.py) | Verdict, screening decision, stop reason and scope |
-| Memory | [`memory/service.py`](../react-agent/src/react_agent/fmri/memory/service.py), [`memory/repository.py`](../react-agent/src/react_agent/fmri/memory/repository.py) | Deterministic episode writing; optional curator proposals |
+| Entry | Source and purpose |
+| --- | --- |
+| fMRI screening | [`fmri/graph.py`](../react-agent/src/react_agent/fmri/graph.py), [`loop.py`](../react-agent/src/react_agent/fmri/loop.py), [`tools/registry.py`](../react-agent/src/react_agent/fmri/tools/registry.py): numeric checks, optional planned diagnostics and scoped reports |
+| Optional image-to-response generation | [`fmri/pipeline_graph.py`](../react-agent/src/react_agent/fmri/pipeline_graph.py), [`generation/`](../react-agent/src/react_agent/fmri/generation/): external TRIBE integration |
+| ReAct conversation | [`graph.py`](../react-agent/src/react_agent/graph.py): separate conversation entry |
+| Studio views | [`langgraph.json`](../react-agent/langgraph.json), [`studio_graph.py`](../react-agent/src/react_agent/eeg_research/agentic/studio_graph.py): the EEG adapter wraps an existing campaign tick as load → step → summarize |
 
-Planner and replanner are modes of one planning responsibility. Rule screening does not require an LLM. The curator runs only when enabled and applicable.
+The figures use cool white, navy, blue and cyan to distinguish stage roles, local runtime work and feedback paths. Arrows denote runtime-mediated handoffs; they do not imply that every stage runs for every task. The [platform gallery](platform.md) labels historical DEMO screenshots separately from these conceptual diagrams.
 
-## Evidence and historical notes
+<details>
+<summary>Legacy action planning</summary>
 
-The figures describe implementation paths. They do not claim every role has been validated in a new live campaign or that performance improved. Historical acceptance records distinguish offline/CPU checks from live-role and GPU runs not executed in their revisions.
+Older campaigns can use `planner_mode: compare_options` or `single_action`. Their planner selects a next action directly; they do not use the current two-call proposal / Critic sequence. The compatibility path remains in [`planner.py`](../react-agent/src/react_agent/eeg_research/agentic/planner.py), [`research_plan.py`](../react-agent/src/react_agent/eeg_research/agentic/research_plan.py) and [`loop.py`](../react-agent/src/react_agent/eeg_research/agentic/loop.py). Use `--execution-version single_plan_v1` when creating a new campaign for the flow described above.
 
-Older documents, including `eeg_research_v1_8.md` and `implementation_inventory.md`, are revision-specific. Their role inventories and limitations may differ from the inspected source. Treat those records as historical evidence, not the latest architecture specification.
+</details>

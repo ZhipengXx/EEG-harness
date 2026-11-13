@@ -2,7 +2,7 @@
 
 EEG-harness opens on autonomous code-level research. A study connects a question, candidate implementation, training job and recorded decision. The workbench makes those records inspectable through process, experiment and code / artifact views.
 
-Current source baseline: [`09dc98f`](https://github.com/ZhipengXx/EEG-harness/tree/09dc98f83e8e4aa944245cfeb661d87e4af2e170). Screenshot baseline: [`14ec3e6`](https://github.com/ZhipengXx/EEG-harness/commit/14ec3e6), committed on 2026-10-01 (UTC+08:00). The original images are application captures from that revision, using synthetic DEMO data. The English process image is a text-localized edit for documentation, not an unedited browser capture. No application view was recaptured for this README update. Subsequent UI changes, including `29fbeed`, are not shown in these images.
+Screenshot baseline: [`14ec3e6`](https://github.com/ZhipengXx/EEG-harness/commit/14ec3e6), committed on 2026-10-01 (UTC+08:00). The original images are application captures from that revision, using synthetic DEMO data. The English process image is a text-localized edit for documentation, not an unedited browser capture. These images are retained as historical views. They do not show the current EEG-harness branding or every current stage and Memory feature; no new application capture is implied.
 
 ## Recorded desktop views
 
@@ -56,7 +56,7 @@ Source: [`workbench_static/app.js`](../react-agent/src/react_agent/fmri/workbenc
 Run the workbench from `react-agent/`:
 
 ```bash
-uv run python -m react_agent.fmri.workbench
+PYTHONPATH=src uv run python -m react_agent.fmri.workbench
 ```
 
 Open [the explicit demo](http://127.0.0.1:8765/?demo=1#research/demo_ui_workspace), or a recorded real study with its data provenance identified. For a new capture set:
@@ -67,6 +67,6 @@ Open [the explicit demo](http://127.0.0.1:8765/?demo=1#research/demo_ui_workspac
 4. Capture code / artifacts with a selected review or analysis record, then check 1024- and 768-pixel layouts.
 5. Record the exact commit, capture date, viewport and DEMO / real-data provenance alongside the replacement images. Replace these historical captions only after the new images exist.
 
-Use application screenshots for platform views and editable conceptual diagrams for collaboration. Keep demo labels visible, retain the paper / ink / teal / copper visual style, and avoid adding unrecorded activity or fabricated curves to a screenshot.
+Use application screenshots for platform views and editable conceptual diagrams for collaboration. New conceptual diagrams use cool white, navy, blue and cyan. Keep application screenshots faithful to the rendered interface, retain demo labels, and record the capture revision alongside any replacement images.
 
 [Start a study](running.md) · [Understand the research loop](architecture.md) · [Edit the illustrations](figures/README.md)

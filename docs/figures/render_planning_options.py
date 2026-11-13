@@ -1,73 +1,54 @@
 #!/usr/bin/env python3
-"""Render the planning comparison using the established README visual system."""
+"""Render current single-plan selection with the shared EEG-harness primitives."""
 
-from render_figures import Figure, INK, LINE, MONO, MUTED, PAPER, RUST, TEAL, WHITE
+from render_figures import Figure, BLUE, INK, LINE, MUTED, PAPER, TEAL, WHITE
 
 
 def planning_options():
-    f = Figure(
-        "04-planning-options", 828,
-        "Planning over alternatives",
-        "A Planner proposes alternatives; an independent Critic compares them and selects one plan for the Designer.",
-    )
-    f.header("04", "Compare before committing.",
-             "2–4 proposals, one independent comparison, one selected plan.")
-    f.text(54, 207, "RESEARCH CONTEXT", 16, MUTED, spacing=1.6)
-    f.text(330, 207, "PLANNER PROPOSALS", 16, MUTED, spacing=1.6)
-    f.text(1386, 207, "INDEPENDENT CRITIC", 16, TEAL, anchor="end", spacing=1.4)
-
-    f.rect(54, 230, 236, 366)
-    f.text(76, 270, "Current study", 26, INK, weight="bold")
-    f.text(76, 302, "EEG / MEG retrieval", 17, TEAL)
-    f.path("M78 342 H101 L113 329 L126 361 L139 317 L151 350 L164 338 H264", TEAL, 2.0)
-    for y, label in ((389, "Question + evidence"), (431, "Eligible targets"),
-                     (473, "Remaining budget"), (515, "Frozen protocol")):
-        f.circle(80, y - 5, 3, RUST)
-        f.text(94, y, label, 17, INK)
-    f.text(76, 563, "Development scope", 16, MUTED)
-
-    f.rect(316, 230, 686, 366, WHITE, LINE)
+    f = Figure('04-planning-options', 1170, 'Planner and Critic select one research task',
+        'Planner uses paper and experiment memory to propose two to four tasks. Critic can retrieve related experimental history before choosing one. New methods go to Designer with selected task context, not the planning history packet. Shown tasks illustrate supported categories, not a required mix.')
+    f.header('04', 'Compare plans before writing code.',
+             'One Planner proposes alternatives. One Critic compares the complete pool.')
+    f.path('M64 210 H724', TEAL, 4)
+    f.path('M830 210 H1376', TEAL, 4)
+    f.text(64, 256, 'Planner retrieves', 31, TEAL, weight='bold')
+    f.text(64, 300, 'Relevant paper and experiment memory', 27, MUTED)
+    f.text(830, 256, 'Critic can add', 31, TEAL, weight='bold')
+    f.text(830, 300, 'Experiment history related to each plan', 26, MUTED)
+    f.text(64, 380, 'Propose 2–4 distinct plans', 34, BLUE, weight='bold')
     rows = [
-        ("A", "Read registered evidence", "Resolve a specific missing record or page.", False),
-        ("B", "Diagnose a result", "Distinguish an unresolved decoding explanation.", False),
-        ("C", "Design a new experiment", "Specify a controlled encoder or loss change.", True),
-        ("D", "Replicate an eligible Full run", "Follow the frozen seed and confirmation policy.", False),
+        ('New method', 'Change a training recipe or EEG encoder.', True),
+        ('Confirmation', 'Test a frozen method at full scope.', False),
+        ('Validation', 'Evaluate a method in the selected scope.', False),
+        ('Diagnosis', 'Analyze existing results without training.', False),
     ]
-    for index, (letter, title, detail, selected) in enumerate(rows):
-        y = 242 + index * 85
-        f.rect(330, y, 658, 73, "#EAF2EE" if selected else PAPER,
-               TEAL if selected else LINE, radius=5, width=1.6 if selected else 1)
-        f.circle(354, y + 31, 13, TEAL if selected else WHITE, TEAL if selected else LINE, 1)
-        f.text(354, y + 37, letter, 16, WHITE if selected else RUST, font=MONO, anchor="middle")
-        f.text(380, y + 29, title, 22, TEAL if selected else INK, weight="bold")
-        f.text(380, y + 54, detail, 16, MUTED)
-
-    f.path("M290 414 H316", RUST, 1.8, arrow="rust")
-    f.path("M1002 448 H1042", TEAL, 2.0, arrow="teal")
-    f.rect(1042, 230, 344, 366, WHITE, TEAL, radius=5, width=1.6)
-    f.text(1064, 260, "SELECTED PLAN / EXAMPLE", 14, TEAL, spacing=1)
-    f.text(1064, 300, "Design experiment", 26, INK, weight="bold")
-    f.text(1064, 333, "Target, evidence and", 18, MUTED)
-    f.text(1064, 359, "selection rationale recorded.", 18, MUTED)
-    f.rule(1064, 382, 1364)
-    f.text(1064, 415, "Critic compares", 22, INK, weight="bold")
-    f.text(1064, 445, "Scientific value / evidence", 17, MUTED)
-    f.text(1064, 470, "Expected information", 17, MUTED)
-    f.text(1064, 495, "Cost and feasibility", 17, MUTED)
-    f.rect(1064, 523, 300, 51, TEAL, TEAL, radius=5)
-    f.text(1214, 556, "Send to Designer", 22, WHITE, weight="bold", anchor="middle")
-
-    f.path("M1214 596 V617 H172 V596", TEAL, 1.6, dash=True, arrow="teal")
-    f.rect(517, 603, 405, 28, PAPER, PAPER)
-    f.text(720, 623, "Update the study record", 18, TEAL, anchor="middle")
-    f.rect(54, 650, 1332, 85)
-    f.text(76, 687, "After the action", 24, INK, weight="bold")
-    f.text(336, 687, "Observed evidence informs the next planning decision.", 22, TEAL)
-    f.text(336, 717, "Compare evidence gaps, expected information, prerequisites and resource estimates.", 17, MUTED)
-    f.footer("Illustrative planning example. The Planner proposes alternatives; the Critic selects one original plan.")
+    for i, (title, detail, selected) in enumerate(rows):
+        y = 416 + i * 124
+        f.rect(64, y, 660, 108, '#EAF0FF' if selected else WHITE,
+               BLUE if selected else LINE, radius=6, width=2 if selected else 1.4)
+        f.path(f'M86 {y+22} V{y+86}', BLUE if selected else LINE, 4)
+        f.text(108, y+43, title, 31, BLUE if selected else INK, weight='bold')
+        f.text(108, y+82, detail, 26, MUTED)
+    f.path('M744 470 H764 V842 H744', BLUE, 2)
+    f.path('M764 610 H820', BLUE, 2.5, arrow='blue')
+    f.rect(830, 416, 546, 320, WHITE, BLUE, radius=8, width=1.6)
+    f.text(864, 470, 'Independent Critic', 35, BLUE, weight='bold')
+    f.text(864, 521, 'Compare scientific value', 28, INK)
+    f.text(864, 565, 'Relate plans to earlier results', 28, INK)
+    f.text(864, 609, 'Weigh information and cost', 28, INK)
+    f.text(864, 684, 'Choose one original proposal', 27, BLUE, weight='bold')
+    f.path('M1103 736 V778', BLUE, 2.5, arrow='blue')
+    f.rect(830, 788, 546, 108, BLUE, BLUE, radius=8)
+    f.text(864, 832, 'Selected task: new method', 30, WHITE, weight='bold')
+    f.text(864, 871, 'An illustrative selection', 26, WHITE)
+    f.rule(64, 945, 1376)
+    f.text(64, 997, 'For a new method, Designer receives', 31, INK, weight='bold')
+    f.text(64, 1043, 'Selected task, this round’s settings, interfaces, and parent source.', 28, MUTED)
+    f.text(64, 1085, 'Execution materials are task-specific; planning history stays with Planner and Critic.', 26, MUTED)
+    f.footer('Illustrative task types. Each round proposes alternatives allowed by the current study state.')
     f.save()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     planning_options()
-    print("Rendered planning options as SVG and a 2160px PNG.")
+    print('Rendered planning options as SVG and a 2160px PNG.')
