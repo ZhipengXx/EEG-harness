@@ -347,6 +347,8 @@ def _complete_multigpu_check(workspace: Path, interpreter: str, spec_path: Path,
         if protocol is None or protocol.get("evaluation_mode") != "loso_method_search":
             receipt = {"ok": False, "error": "multigpu_probe_frozen_protocol_missing"}
         else:
+            from react_agent.eeg_research.agentic.run_context import resolve_execution_protocol
+            protocol = resolve_execution_protocol(camp, workspace.name, protocol)
             receipt = run_multigpu_check(camp, protocol, workspace=workspace, python=interpreter, timeout_s=min(timeout_s, 120.0))
             if receipt.get("ok"):
                 try:

@@ -33,12 +33,12 @@ def research_env(candidate_extension: Path | None) -> dict[str, str]:
 
 
 def _row_fingerprint(row: dict[str, Any]) -> str | None:
-    value = row.get("execution_fingerprint") or row.get("contract_fingerprint")
+    value = row.get("evaluation_comparison_fingerprint") or row.get("execution_fingerprint") or row.get("contract_fingerprint")
     return str(value) if value else None
 
 
 def comparable(left: dict[str, Any], right: dict[str, Any]) -> bool:
-    """Same contract and full fidelity. Pilot and unknown source stay out of the ranking."""
+    """Same evaluation population/policy; approved training recipes may differ."""
     left_fp = _row_fingerprint(left)
     right_fp = _row_fingerprint(right)
     return (
@@ -149,6 +149,9 @@ def accept_job(
         "implementation_failure": False,
         "execution_fingerprint": None if protocol is None else protocol.get("fingerprint"),
     }
+    if protocol is not None:
+        from .execution_protocol import evaluation_comparison_config, _fingerprint
+        record["evaluation_comparison_fingerprint"] = _fingerprint(evaluation_comparison_config(protocol))
     if protocol is not None and protocol.get("evaluation_mode") == "loso_method_search":
         record.update(evaluation_mode="loso_method_search", metric_scope="fold_development_execution_only",
                       scientific_ranking_eligible=False, fixed_bank_top5=payload.get("fixed_bank_top5"),

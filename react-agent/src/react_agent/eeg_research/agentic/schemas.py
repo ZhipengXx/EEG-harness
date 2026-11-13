@@ -159,6 +159,7 @@ class PlannerActionPayload(DomainOutput):
     report_revision: list[ReportClaimRevision] = Field(default_factory=list)
     query: str | None = None
     target_binding: dict[str, Any] = Field(default_factory=dict)
+    diagnostic_request: dict[str, Any] | None = None
     exhaustion_receipt: dict[str, Any] | None = None
 
 
@@ -255,6 +256,9 @@ class ResearchPlanProposal(DomainOutput):
     target_candidate_ref: str | None = Field(default=None, description=(
         "Existing exact runtime candidate_id for diagnosis, validation or confirmation; new_method uses null."
         " Use only delivered candidate IDs, such as baseline; method names and example IDs are not targets."))
+    parent_ref: str | None = Field(default=None, min_length=1, description=(
+        "Selected reusable parent for a new method. Existing-method measurement tasks use null; "
+        "the parent is separate from target_candidate_ref and the matched control."))
     scientific_intent: str = Field(min_length=1, max_length=2000)
     evaluation_scope: dict[str, Any] = Field(json_schema_extra={
         "properties": {"phase": {"type": "string", "enum": ["screening_2fold", "confirmation_10fold", "full", "pilot", "diagnostic"]},
@@ -264,21 +268,24 @@ class ResearchPlanProposal(DomainOutput):
     expected_observation: str = Field(min_length=1, max_length=1200)
     completion_condition: str = Field(min_length=1, max_length=1200)
     required_context_refs: list[str] = Field(default_factory=list, max_length=8, description=(
-        "Use only delivered verified artifact_id or context:// source refs. Use [] when none are required."
-        " JSON pointers, hashes, paths and prospective sources are not references."))
+        "Delivered verified context:// sources used by the method or diagnosis, including cited inline paper findings;"
+        " art_* references identify materials required to execute the task. Use [] when neither applies."))
     cost_assessment: dict[str, Any] = Field(default_factory=dict)
     implementation_risk: str | None = Field(default=None, min_length=1, max_length=1000,
         description="Predicted engineering risk for this task; not execution permission or measured evidence.")
     value_rationale: str = Field(min_length=1, max_length=1500)
     basis_observation_ids: list[str] = Field(default_factory=list, max_length=8, description=(
-        "observation_id values from this round's delivered experiment_observations or experiment_history"
-        " that this proposal builds on or deliberately departs from. Use [] when none apply."))
+        "Delivered observation_id values used as evidence or deliberate historical comparisons for this proposal,"
+        " including detailed observations and history-index entries. Use [] when none apply."))
+    comparison_observation_ids: list[str] = Field(default_factory=list, max_length=8, description=(
+        "Delivered historical experiments whose measured results this round needs to compare against."
+        " These may differ from the implementation parent and general proposal evidence; use [] when none apply."))
 
     @model_serializer(mode="wrap")
     def preserve_legacy_proposal_shape(self, handler):
         # Pool digests bind the dumped proposals; unset newer fields keep old pools exact.
         row = handler(self)
-        for key in ("implementation_risk", "basis_observation_ids"):
+        for key in ("implementation_risk", "basis_observation_ids", "comparison_observation_ids", "parent_ref"):
             if key not in self.model_fields_set:
                 row.pop(key, None)
         return row
@@ -304,12 +311,14 @@ class PlanningWireOutput(DomainOutput):
 
 
 class PlannerProposalWire(PlanningWireOutput):
+    parent_ref: PlanningText | None
     question: PlanningText = Field(max_length=1200)
     method: PlanningText = Field(max_length=2500)
     rationale: PlanningText = Field(max_length=1500)
     expected_observation: PlanningText = Field(max_length=1200)
     implementation_risk: PlanningText | None = Field(max_length=1000)
     basis_observation_ids: list[PlanningText] = Field(max_length=8)
+    comparison_observation_ids: list[PlanningText] = Field(max_length=8)
     required_context_refs: list[PlanningText] = Field(max_length=8)
 
 
@@ -502,6 +511,32 @@ class AnalysisRequirement(DomainOutput):
     verification: Literal["evidence_grounding", "paired_comparison", "scope_limits", "hypothesis_assessment"]
 
 
+class TrainingRecipe(DomainOutput):
+    """Candidate-owned training settings, resolved before job creation."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    epochs: int = Field(ge=1)
+    lr: float = Field(gt=0, allow_inf_nan=False)
+    batch_size: int = Field(ge=1)
+    weight_decay: float = Field(ge=0, allow_inf_nan=False)
+
+
+class DesignTrainingChange(DomainOutput):
+    """Training configuration has no corresponding candidate Python hook."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    mode: Literal["inherit", "replace"]
+    config: TrainingRecipe | None
+
+    @model_validator(mode="after")
+    def explicit_config_mode(self):
+        if self.mode == "replace" and self.config is None:
+            raise ValueError("replace_training_requires_config")
+        if self.mode == "inherit" and self.config is not None:
+            raise ValueError("inherit_training_cannot_override_config")
+        return self
+
+
 class DesignerExperimentSpec(BaseModel):
     """The executable fields required by the deterministic experiment gate."""
 
@@ -556,6 +591,8 @@ class DesignerBrief(DomainOutput):
     principal_intervention: str = Field(min_length=1)
     scientific_parameters: dict[str, Any] = Field(default_factory=dict)
     hook_changes: DesignHookChanges
+    training_change: DesignTrainingChange = Field(
+        default_factory=lambda: DesignTrainingChange(mode="inherit", config=None))
     implementation_requirements: list[DesignRequirement] = Field(default_factory=list)
     measurement_requirements: list[MeasurementRequirement] = Field(default_factory=list)
     analysis_requirements: list[AnalysisRequirement] = Field(default_factory=list)
@@ -568,7 +605,7 @@ class DesignerBrief(DomainOutput):
     @model_serializer(mode="wrap")
     def preserve_legacy_brief_shape(self, handler):
         row = handler(self)
-        for name in ("measurement_requirements", "analysis_requirements"):
+        for name in ("measurement_requirements", "analysis_requirements", "training_change"):
             if name not in self.model_fields_set:
                 row.pop(name, None)
         return row
@@ -713,6 +750,7 @@ class DesignerBriefContent(DesignerWireOutput):
     hypothesis: DesignerText
     principal_intervention: DesignerText
     hook_changes: DesignerHookChanges
+    training_change: DesignTrainingChange
     scientific_parameters: dict[str, Any]
     implementation_requirements: list[DesignerImplementationRequirement]
     analysis_requirements: list[DesignerAnalysisRequirement]
@@ -1014,22 +1052,6 @@ class EvaluationContract(BaseModel):
     fingerprint: str = ""
     comparable: bool = True
     incomparable_reason: str | None = None
-
-
-class TrainingRecipe(BaseModel):
-    """Approved training recipe. Does not include the evaluation split."""
-
-    model_config = ConfigDict(extra="allow")
-
-    optimizer: str = "adamw"
-    batch_size: int
-    lr: float
-    weight_decay: float
-    global_batch: int | None = None
-    negative_sampling_policy: str = "data_parallel_local"
-    early_stop: str = "single_early"
-    precision: str = "fp32"
-    full_epochs: int
 
 
 class RunSpec(BaseModel):

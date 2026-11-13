@@ -176,9 +176,12 @@ def append_history(
     *,
     fixed_bank_top1: float | None = None,
     fixed_bank_top5: float | None = None,
+    loss_terms: dict[str, float] | None = None,
+    loss_term_batches: dict[str, int] | None = None,
+    train_batch_count: int | None = None,
 ) -> None:
     """Append one finished epoch. val_top1 is within-batch; fixed_bank_top1 ranks the whole bank."""
-    row: dict[str, float | int] = {
+    row: dict[str, object] = {
         "epoch": epoch,
         "train_loss": train_loss,
         "val_top1": val_top1,
@@ -187,6 +190,9 @@ def append_history(
     if fixed_bank_top1 is not None and fixed_bank_top5 is not None:
         row["fixed_bank_top1"] = fixed_bank_top1
         row["fixed_bank_top5"] = fixed_bank_top5
+    if loss_terms:
+        row.update(loss_terms=loss_terms, loss_term_batches=loss_term_batches,
+                   train_batch_count=train_batch_count)
     with (out_dir / "history.jsonl").open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(row) + "\n")
 
@@ -312,7 +318,8 @@ def _stored_test_result(out: Path) -> dict[str, float] | None:
     return {"top1": float(result["top1"]), "top5": float(result["top5"])}
 
 
-def score_held_out(design: Design, data_root: Path, out_dir: Path) -> dict[str, object] | None:
+def score_held_out(design: Design, data_root: Path, out_dir: Path, *,
+                   diagnostic_capture: dict | None = None) -> dict[str, object] | None:
     """Score the held-out test files after fit. A missing cache is not a score."""
     plan = split_plan(data_root, design)
     cache = feature_cache(data_root, design, "test")
@@ -346,7 +353,7 @@ def score_held_out(design: Design, data_root: Path, out_dir: Path) -> dict[str, 
     dataset = RetrievalTrials(records, timesteps)
     loader = DataLoader(dataset, batch_size=min(200, len(dataset)), shuffle=False, collate_fn=collate_retrieval)
     encoder = _load_encoder(spec, checkpoint, out_dir)
-    result = _fixed_bank_pass(encoder, loader, records)
+    result = _fixed_bank_pass(encoder, loader, records, capture=diagnostic_capture)
     scored = {
         "top1": result["fixed_bank_top1"],
         "top5": result["fixed_bank_top5"],
@@ -451,7 +458,7 @@ def _load_encoder(spec: dict[str, object], checkpoint: Path, out_dir: Path | Non
     return rebuild_encoder(spec, checkpoint, directory)
 
 
-def _fixed_bank_pass(encoder, loader, records) -> dict[str, float]:
+def _fixed_bank_pass(encoder, loader, records, *, capture: dict | None = None) -> dict[str, float]:
     """Rank each batch's queries against every image in this split."""
     import torch
 
@@ -461,7 +468,10 @@ def _fixed_bank_pass(encoder, loader, records) -> dict[str, float]:
     bank, labels = frozen_bank(records)
     if not torch.isfinite(bank).all():
         raise SplitError("non_finite_evaluation_image_features")
-    tally = FixedBankTally(bank.to(device), labels.to(device))
+    if capture is not None:
+        capture["gallery_ids"] = list(dict.fromkeys(str(row["img"]) for row in records))
+        capture["total_query_count"] = len(records)
+    tally = FixedBankTally(bank.to(device), labels.to(device), capture=capture)
     encoder.eval()
     with torch.no_grad():
         for batch in loader:
@@ -743,9 +753,47 @@ def _replica_device_probe(receipts):
         scale = _logit_scale(scale_owner, inputs[0].device)
         receipts.append({"input_device": str(inputs[0].device), "local_batch_size": int(inputs[0].shape[0]),
                          "parameter_devices": sorted({str(value.device) for value in parameters}),
-                         "loss_device": str(loss.device), "logit_scale": float(scale.detach()),
-                         "temperature": 1.0 / float(scale.detach()) if float(scale.detach()) > 0 else None})
+                         "loss_device": str(loss.device), "scale_argument": {
+                             "owner": "encoder" if scale_owner is getattr(module, "encoder", None) else "retrieval_wrapper",
+                             "value": float(scale.detach()), "sampling_time": "forward_before_optimizer_step",
+                             "usage": "passed_to_objective; custom_objective_may_ignore"}})
     return observe
+
+
+def _resolved_model_configuration(encoder):
+    """Record defaults owned by the native constructor, not guessed custom settings."""
+    from react_agent.eeg_training.model import EEGProjectLayer
+
+    model_type = type(encoder).__module__ + "." + type(encoder).__qualname__
+    if type(encoder) is EEGProjectLayer:
+        return {"status": "observed", "origin": "native_encoder_constructor", "model_type": model_type,
+                "values": {"z_dim": encoder.z_dim, "drop_proj": encoder.drop_proj,
+                           "c_num": encoder.c_num, "timesteps": list(encoder.timesteps)}}
+    return {"status": "unavailable", "model_type": model_type,
+            "reason": "custom_encoder_defaults_not_exported"}
+
+
+def _objective_sample(snapshot, *, custom):
+    """Serialize independent replica values; scales and reciprocals are not averaged."""
+    import math
+
+    epoch, batch_index, position, batch_size, diagnostics = snapshot
+    values, nonfinite = {}, {}
+    for name, tensor in diagnostics.items():
+        values[name] = []
+        for replica_index, value in enumerate(tensor.reshape(-1).cpu().tolist()):
+            if math.isfinite(value):
+                values[name].append(value)
+            else:
+                values[name].append(None)
+                nonfinite.setdefault(name, []).append({"replica_index": replica_index,
+                    "value_kind": "nan" if math.isnan(value) else "positive_infinity" if value > 0 else "negative_infinity"})
+    return {"epoch": epoch, "batch_index": batch_index, "batch_position": position,
+            "global_batch_size": batch_size, "sampling_time": "forward_before_optimizer_step",
+            "origin": "custom_objective_return" if custom else "native_contrastive_loss",
+            "status": "partial" if nonfinite else "observed" if diagnostics else "unavailable",
+            **({"replica_values": values} if diagnostics else {"reason": "objective_diagnostics_not_exported"}),
+            **({"nonfinite_values": nonfinite} if nonfinite else {})}
 
 
 def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
@@ -845,6 +893,17 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
     early_stop_enabled = design.stop in {"single_early", "chain_early"}
     duplicate_batches: list[list[str]] = []
     device_receipts = []
+    objective_samples, last_objective_snapshot = [], None
+    training_receipt = {
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"), "gpu": list(design.gpu),
+        "negative_sampling_policy": negative_policy, "objective_is_custom": custom,
+        "loss_definition": "candidate_custom_objective" if custom else "symmetric_diagonal_contrastive_cross_entropy",
+        "loss_direction_reduction": "unknown" if custom else "mean", "loss_replica_reduction": "mean",
+        "loss_epoch_reduction": "arithmetic_mean_of_batch_scalars",
+        "optimizer_learning_rates": [float(group["lr"]) for group in optimizer.param_groups],
+        "embedding_dtype": str(next(encoder.parameters()).dtype),
+        "resolved_model_configuration": _resolved_model_configuration(encoder),
+        "batches": device_receipts, "objective_samples": objective_samples}
     write_status(out_dir, "training", 0, design.epochs)
     for epoch_index in range(design.epochs):
         if use_global:
@@ -855,7 +914,9 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
             assert model is not None
             model.train()
         losses: list[float] = []
+        term_totals, term_batches = {}, {}
         for batch_index, batch in enumerate(train_loader):
+            sample_objective = (epoch_index == 0 and batch_index == 0) or batch_index == len(train_loader) - 1
             eeg = apply_train_transform(transform, batch["eeg"].to(device), counters)
             img = batch["img_features"].to(device)
             ids = _batch_image_ids(batch)
@@ -865,7 +926,11 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
                 assert wrapped is not None
                 eeg_z = wrapped(eeg)
                 scale = _logit_scale(encoder, device)
-                loss = scalar_loss(compute_objective(objective, eeg_z, img, scale, ids))
+                result = compute_objective(objective, eeg_z, img, scale, ids, return_terms=True,
+                                           return_diagnostics=sample_objective)
+                loss, loss_terms = result[:2]
+                objective_diagnostics = result[2] if sample_objective else {}
+                loss = scalar_loss(loss)
             else:
                 assert model is not None
                 probe, probe_handle = [], None
@@ -874,9 +939,11 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
                     probe_handle = underlying.register_forward_hook(_replica_device_probe(probe))
                 if ids:
                     codes = torch.tensor([int(hashlib.sha256(item.encode("utf-8")).hexdigest()[:8], 16) % (2**31) for item in ids], device=device, dtype=torch.long)
-                    loss, _top1, _top5 = model(eeg, img, codes)
+                    result = model(eeg, img, codes, return_loss_terms=True, return_objective_diagnostics=sample_objective)
                 else:
-                    loss, _top1, _top5 = model(eeg, img)
+                    result = model(eeg, img, return_loss_terms=True, return_objective_diagnostics=sample_objective)
+                loss, _top1, _top5, loss_terms = result[:4]
+                objective_diagnostics = result[4] if sample_objective else {}
                 if probe_handle is not None:
                     probe_handle.remove()
                 # LocalRetrieval checked each scalar objective; gather adds one
@@ -884,7 +951,17 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
                 if isinstance(model, torch.nn.DataParallel):
                     loss = loss.mean()
                 loss = scalar_loss(loss)
+            if sample_objective:
+                last_objective_snapshot = (epoch_index + 1, batch_index,
+                    "first" if batch_index == 0 else "tail", int(eeg.shape[0]), objective_diagnostics)
+                if epoch_index == 0:
+                    objective_samples.append(_objective_sample(last_objective_snapshot, custom=custom))
             losses.append(float(loss.detach()))
+            # Match the optimized loss's replica mean and epoch batch mean.
+            # Accumulate detached tensors on-device; transfer once per epoch.
+            for name, value in loss_terms.items():
+                term_totals[name] = term_totals.get(name, 0) + value.mean()
+                term_batches[name] = term_batches.get(name, 0) + 1
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
@@ -897,17 +974,8 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
                     "optimizer_state_devices": {key: sorted({str(value.device) for state in optimizer.state.values()
                         for name, value in state.items() if name == key and isinstance(value, torch.Tensor)})
                         for key in ('step', 'exp_avg', 'exp_avg_sq')}})
-                (out_dir / "training_devices.json").write_text(json.dumps({
-                    "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"), "gpu": list(design.gpu),
-                    "negative_sampling_policy": negative_policy,
-                    "objective_is_custom": custom,
-                    "loss_definition": "candidate_custom_objective" if custom else "symmetric_diagonal_contrastive_cross_entropy",
-                    "loss_direction_reduction": "unknown" if custom else "mean",
-                    "loss_replica_reduction": "mean",
-                    "loss_epoch_reduction": "arithmetic_mean_of_batch_scalars",
-                    "optimizer_learning_rates": [float(group["lr"]) for group in optimizer.param_groups],
-                    "embedding_dtype": str(next(encoder.parameters()).dtype),
-                    "batches": device_receipts}, indent=2), encoding="utf-8")
+            if sample_objective and epoch_index == 0:
+                (out_dir / "training_devices.json").write_text(json.dumps(training_receipt, indent=2), encoding="utf-8")
         scores_top1: list[float] = []
         scores_top5: list[float] = []
         tally = FixedBankTally(bank, bank_labels)
@@ -959,6 +1027,9 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
                 val_top5,
                 fixed_bank_top1=fixed["fixed_bank_top1"],
                 fixed_bank_top5=fixed["fixed_bank_top5"],
+                loss_terms={name: float(value / term_batches[name]) for name, value in term_totals.items()},
+                loss_term_batches=term_batches,
+                train_batch_count=len(losses),
             )
         write_status(out_dir, "training", finished, design.epochs)
         last_fixed = fixed["fixed_bank_top1"]
@@ -975,6 +1046,16 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
             torch.save(payload, out_dir / "last.ckpt")
         if early_stop_enabled and selection.stall >= 5:
             break
+    if last_objective_snapshot is not None:
+        last_sample = _objective_sample(last_objective_snapshot, custom=custom)
+        last_sample["last_used"] = True
+        existing = next((row for row in objective_samples
+                         if (row["epoch"], row["batch_index"]) == (last_sample["epoch"], last_sample["batch_index"])), None)
+        if existing is None:
+            objective_samples.append(last_sample)
+        else:
+            existing["last_used"] = True
+        (out_dir / "training_devices.json").write_text(json.dumps(training_receipt, indent=2), encoding="utf-8")
     write_status(out_dir, "finished", finished, design.epochs)
     if duplicate_batches:
         (out_dir / "train_batch_image_ids.jsonl").write_text(
@@ -1068,6 +1149,8 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
             positives,
             limit=limit,
             checkpoint_id=str(checkpoint),
+            checkpoint_role="selected_checkpoint",
+            checkpoint_epoch=best_epoch,
             sample_seed=sample_seed,
             total_query_count=reservoir.seen,
             sampling_policy="uniform_reservoir_without_replacement",
@@ -1099,6 +1182,7 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
         config_hash=config_hash,
     )
     (out_dir / "capabilities_used.json").write_text(json.dumps(used, ensure_ascii=False, indent=2), encoding="utf-8")
+    from react_agent.eeg_training.inference_consistency import training_recipe
     return {
         "primary_metric": best,
         "metric_name": "fixed_bank_top1",
@@ -1122,6 +1206,8 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
         "saved_top1": selection.saved_best,
         "stop_reason": "epochs_completed" if finished == design.epochs else "development_patience_exhausted",
         "training_complete": finished == design.epochs,
+        "training_recipe": {key: value for key, value in training_recipe(design).items()
+                            if key in {"epochs", "lr", "batch_size", "weight_decay"}},
     }
 
 

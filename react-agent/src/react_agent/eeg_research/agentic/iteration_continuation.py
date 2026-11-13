@@ -36,11 +36,7 @@ def apply_continuation_goal(camp: Path, goal: dict) -> dict:
     if not receipt:
         return goal
     return {**goal, "research_execution": {
-        **goal.get("research_execution", {}), "max_completed_rounds": receipt["requested_rounds"]},
-        "objective": goal.get("objective", "") + (
-            f"\nThe current execution target supersedes the original iteration count: "
-            f"continue this same study for {receipt['additional_rounds']} additional iterations "
-            f"({receipt['requested_rounds']} total), using its existing observations and memory.")}
+        **goal.get("research_execution", {}), "max_completed_rounds": receipt["requested_rounds"]}}
 
 
 def apply_continuation_scope(camp: Path, state: dict) -> None:

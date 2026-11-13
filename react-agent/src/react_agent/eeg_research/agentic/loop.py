@@ -502,11 +502,13 @@ def _recover_decision_reads(camp: Path, state: dict[str, Any]) -> None:
                 raise ValueError("artifact_read_receipt_identity_changed")
             if receipt.get("decision_id") and receipt["decision_id"] not in persisted_ids:
                 raise ValueError("artifact_read_receipt_decision_missing")
+    from .decision_receipts import read_projected_decision, receipt_groups
+    # Publication recovery is complete; this loop only reads receipt outcomes.
+    receipts_by_decision = receipt_groups(camp) if paths else {}
     for path in paths:
         if _decision_number(path.stem) < 1:
             continue
-        from .decision_receipts import read_projected_decision
-        body = read_projected_decision(camp, path.stem)
+        body = read_projected_decision(camp, path.stem, receipts_by_decision=receipts_by_decision)
         record, raw = body.get("decision"), body.get("raw")
         if not isinstance(record, dict) or record.get("decision_id") != path.stem:
             raise ValueError("decision_file_identity_conflict:" + path.stem)
@@ -773,7 +775,9 @@ def candidate_implementation_target(camp: Path, state: dict[str, Any]) -> str:
     return f"c{index}"
 
 
-def observation(camp: Path) -> dict[str, Any]:
+def observation(camp: Path, *, verified_sources: dict | None = None) -> dict[str, Any]:
+    if verified_sources is not None:
+        verified_sources.clear()
     state = load_state(camp)
     from react_agent.eeg_research.agentic.candidate_lifecycle import sync
     sync(camp, state)
@@ -790,6 +794,9 @@ def observation(camp: Path) -> dict[str, Any]:
         if manifest(camp).get("evaluation_schedule") == "screen_then_confirm":
             from react_agent.eeg_research.agentic.screening import verified_screening_records
             method_screenings = verified_screening_records(camp, state)
+        if verified_sources is not None:
+            verified_sources.update({(row["kind"], str(Path(row["suite_ref"]).resolve()), row["result_hash"]): row
+                                     for row in [*verified, *method_screenings]})
     state = {**state, "action_input_epochs": input_epochs(camp, state,
         verified_records=[*method_screenings, *verified] if method_mode else None)}
     if method_mode:
@@ -843,7 +850,7 @@ def observation(camp: Path) -> dict[str, Any]:
     experiment = state.get("experiment") if isinstance(state.get("experiment"), dict) else {}
     parent_id = experiment.get("parent_candidate_id") or "baseline"
     control_id = experiment.get("control_candidate_id") or "baseline"
-    from react_agent.eeg_research.agentic.handoffs import candidate_context, development_view, load_analysis_views, implementation_lifecycle_context, training_target_source_context, verified_encoder_structural_facts
+    from react_agent.eeg_research.agentic.handoffs import candidate_context, development_view, load_analysis_views, implementation_lifecycle_context, training_target_source_context, verified_encoder_structural_facts, planner_parent_config_context
 
     from react_agent.eeg_research.agentic.audit_context import audit_feedback
     from react_agent.eeg_research.agentic.handoffs import (
@@ -931,6 +938,7 @@ def observation(camp: Path) -> dict[str, Any]:
         "implementation_source": candidate_context(camp, str(state["_implementation_target"])) if state.get("_implementation_target") else None,
         "implementation_lifecycle": implementation_lifecycle_context(camp, state, str(state["_implementation_target"]), actions),
         "training_target_sources": training_target_source_context(camp, state, eligible_targets(state)),
+        "parent_method_configs": planner_parent_config_context(camp, state),
         "verified_encoder_structural_facts": verified_encoder_structural_facts(camp, state),
         "blocked_actions": blocked_actions(state),
         "trainable_ids": trainable,
@@ -1018,7 +1026,10 @@ def observation(camp: Path) -> dict[str, Any]:
     from react_agent.eeg_research.agentic.planner import cost_estimates
     public["action_cost_estimates"] = cost_estimates(state, public, camp=camp)
     from react_agent.eeg_research.agentic.research_progress import progress_context, verified_diagnostic_facts
-    public["research_progress"] = progress_context(camp, state, goal, public["budget"], public["available_actions"])
+    public["research_progress"] = progress_context(camp, state, goal, public["budget"], public["available_actions"],
+        verified_complete=verified if method_mode else None,
+        verified_screenings=method_screenings if method_mode else None,
+        phase_targets=state.get("_phase_eligible_targets"))
     if method_mode:
         public["research_progress"]["complete_methods"] = [{key: row[key] for key in (
             "evidence_id", "candidate_id", "method_revision", "suite_id", "suite_ref", "suite_hash",
@@ -1115,7 +1126,7 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
                     # CPU work reads no new EEG or scores; training still checks
                     # data/cache dependencies at its native launch boundary.
                     from react_agent.eeg_research.agentic.method_suite import manifest, verify_dependencies
-                    verify_dependencies(manifest(camp)["framework_dependencies"])
+                    verify_dependencies(manifest(camp)["framework_dependencies"], camp=camp)
                     state["resource_wait"] = {"kind": "gpu_busy", "detail": str(exc), "cpu_actions_may_continue": True}
                     save_state(camp, state)
                     resource_wait = True
@@ -1387,7 +1398,7 @@ def _apply_action(
     decision: dict[str, Any],
     runner: Any,
     services: Services,
-    obs: dict[str, Any],
+    obs: dict[str, Any] | None,
 ) -> None:
     """Run one already chosen action. Does not allocate a new decision id."""
     # Control may change while the paid Planner request is in flight. Preserve
@@ -1401,9 +1412,13 @@ def _apply_action(
            decision.get("raw") if isinstance(decision.get("raw"), dict) else _decision_raw(camp, str(decision.get("decision_id") or "")))
     from .selected_plan import verify_internal_decision
     internal_plan = verify_internal_decision(camp, state, decision)
-    if obs.get("planner_mode") == "compare_options" or any(raw.get(key) for key in ("options", "read_requests", "resolves_issue_ids", "report_revision")) or action == "revise_report":
+    if (internal_plan is not None or obs is None or obs.get("planner_mode") == "compare_options"
+            or any(raw.get(key) for key in ("options", "read_requests", "resolves_issue_ids", "report_revision"))
+            or action == "revise_report"):
         from react_agent.eeg_research.agentic.planner import _parse, validate_comparison_and_reads
         live = observation(camp)
+        if obs is None:
+            obs = live
         if internal_plan is not None:
             # A persisted selected-task intent replaces only outer comparison;
             # native target/source/scope/read/budget gates below still apply.
@@ -1561,11 +1576,14 @@ def _apply_action(
         _retrieve_methods(camp, state, raw, services)
     elif action == "diagnose_results":
         _append_derived(state, _diagnose(camp, state))
-        if (state.get("last_local_result") or {}).get("new_information") and services.get("analyze_diagnostics"):
+        if (internal_plan is None and (state.get("last_local_result") or {}).get("new_information")
+                and services.get("analyze_diagnostics")):
             services["analyze_diagnostics"](camp, state, state.get("last_local_result"))
     elif action == "collect_diagnostics":
-        _collect_diagnostics(camp, state)
-        if (state.get("last_local_result") or {}).get("new_information") and services.get("analyze_diagnostics"):
+        _collect_diagnostics(camp, state, raw.get("diagnostic_request"))
+        # Selected-plan diagnosis invokes its Analyst after the collection step.
+        if (internal_plan is None and (state.get("last_local_result") or {}).get("new_information")
+                and services.get("analyze_diagnostics")):
             services["analyze_diagnostics"](camp, state, state.get("last_local_result"))
     elif action == "design_experiment":
         _design_experiment(camp, state, decision, raw, services)
@@ -1740,100 +1758,42 @@ def _retrieve_methods(camp: Path, state: dict[str, Any], raw: dict[str, Any], se
 
 
 def _design_context(camp: Path, state: dict[str, Any], spec: dict[str, Any]) -> dict[str, Any]:
-    """Verified inputs the designer actually receives. Missing pieces stay listed."""
-    from react_agent.eeg_research.agentic.budget import snapshot as budget_snapshot
-    from react_agent.eeg_research.agentic.capabilities import capability_manifest
-    from react_agent.eeg_research.agentic.confirmation_policy import load_confirmation_policy
-    from react_agent.eeg_research.agentic.measurement_context import measured_parameter_counts
+    """Bind the chosen method and implementation inputs, without research recall."""
+    from .capabilities import capability_manifest
+    from .confirmation_policy import load_confirmation_policy
+    from .handoffs import candidate_context, development_view, selected_read_context
+    from .measurement_context import measured_parameter_counts
     from .native_authorization import effective_goal
-
-    missing: list[str] = []
-    from react_agent.eeg_research.agentic.handoffs import candidate_context, development_view, load_analysis_views, matched_diagnostics, verified_encoder_structural_facts
+    from .research_execution import single_plan_enabled
 
     parent = str(spec.get("parent_candidate_id") or "baseline")
     control = str(spec.get("control_candidate_id") or "baseline")
-    diagnostics = matched_diagnostics(state, parent)
-    method_parent = None
-    screening_parent = None
-    sources_by_evidence_id = {}
-    artifacts_by_id = {}
-    if state.get("evaluation_mode") == "loso_method_search":
-        from react_agent.eeg_research.agentic.method_suite import verified_suite_records
-        from react_agent.eeg_research.agentic.handoffs import method_suite_scalar_view
-        # Designer receives a matched_diagnostics summary wrapper, rather than
-        # the Analyst's aggregate/sibling shape. Use the same verified scalar
-        # view as Planner before wrapping it, keeping every fold and measured
-        # scalar while referring to immutable raw freeze detail by hash.
-        rows = verified_suite_records(camp, state, target_ids={parent, control})
-        sources_by_evidence_id.update((row["evidence_id"], row) for row in rows)
-        source = next((row for row in reversed(rows) if row.get("candidate_id") == parent), None)
-        if source is not None:
-            method_parent = method_suite_scalar_view(source)
-            diagnostics = matched_diagnostics({"evidence": [method_parent]}, parent)
-        else:
-            diagnostics = None
-            if _read(camp / "goal.json").get("evaluation_schedule") == "screen_then_confirm":
-                from react_agent.eeg_research.agentic.screening import verified_screening_records
-                screening_rows = verified_screening_records(camp, state, target_ids={parent, control})
-                sources_by_evidence_id.update((row["evidence_id"], row) for row in screening_rows)
-                screening_parent = next((row for row in reversed(screening_rows)
-                                         if row.get("candidate_id") == parent), None)
-                if screening_parent is not None:
-                    diagnostics = {"status": "verified_two_fold_screening", "scope": "two_fold_development",
-                        "screening": screening_parent["screening"], "independent_final_test": False}
-                elif parent == "baseline":
-                    # A baseline trained for a candidate's screen may have no
-                    # standalone evidence row. Follow that accepted pair's
-                    # exact control binding instead of treating it as cold start.
-                    latest_pair = next((row for row in reversed(state.get("evidence") or [])
-                        if row.get("kind") == "method_screening" and row.get("evaluation_valid") is True
-                        and (row.get("screening") or {}).get("baseline_scores")), None)
-                    if latest_pair is not None:
-                        pairs = verified_screening_records(camp, state, evidence_ids={latest_pair["evidence_id"]})
-                        if pairs:
-                            from .handoffs import matched_screening_baseline_diagnostics
-                            sources_by_evidence_id[pairs[0]["evidence_id"]] = pairs[0]
-                            diagnostics = matched_screening_baseline_diagnostics(camp, pairs[0])
-    if diagnostics is None:
-        missing.append("diagnostics")
-    methods = state.get("method_hits") or []
-    method_origin = "campaign_retrieval"
-    if not methods:
-        # These are actual bundled local method cards, not an invented paid
-        # Librarian result or a claim of online literature retrieval.
-        from react_agent.eeg_research.agentic.knowledge import retrieve_methods
-        methods = retrieve_methods("").get("hits") or []
-        method_origin = "runtime_bundled_local_cards"
-    if not methods:
-        missing.append("method_evidence")
     contract_path = camp / "evaluation_contract.json"
     contract = _read(contract_path) if contract_path.is_file() else {}
-    if not contract:
-        missing.append("evaluation_contract")
-    from react_agent.eeg_research.agentic.audit_context import audit_feedback
-    from react_agent.eeg_research.agentic.handoffs import selected_read_context
-    from react_agent.eeg_research.agentic.research_progress import verified_diagnostic_facts
+    selected = None
+    if single_plan_enabled(camp):
+        from .selected_plan import load_plan
+        selected = load_plan(camp, state)
+    # Only explicitly selected dependencies may be read; a previous frontier's
+    # artifacts and diagnostics are not an implementation assignment.
+    refs = [ref for ref in (selected or {}).get("proposal", {}).get("required_context_refs") or []
+            if ref.startswith("art_")]
+    reads = selected_read_context(camp, {**state, "active_artifact_refs": refs,
+                                       "active_read_digests": []}) if refs else []
+    counts = measured_parameter_counts(camp)
+    counts["by_candidate"] = {key: value for key, value in counts.get("by_candidate", {}).items()
+                              if key in {parent, control}}
+    counts["status"] = "measured" if counts["by_candidate"] else "unavailable"
     context = development_view({
         "evaluation_mode": state.get("evaluation_mode", "single_target"),
-        "verified_development_facts": verified_diagnostic_facts(camp, state, target_ids={parent, control}, max_facts=12),
-        "verified_encoder_structural_facts": verified_encoder_structural_facts(camp, state, target_ids={parent, control}),
-        "previous_design_failure": state.get("design_failure"),
-        "artifact_reads": selected_read_context(camp, state),
-        "audit_issues": [row for row in audit_feedback(camp, state)["issues"] if row["issue_id"] in (state.get("active_issue_ids") or [])],
+        "artifact_reads": reads,
         "hypothesis": spec.get("hypothesis") or state.get("hypothesis"),
         "goal": _planner_goal(effective_goal(camp)),
+        # Kept for native assembly/approval; the provider only sees this round.
         "confirmation_policy": load_confirmation_policy(camp),
-        "diagnostics": diagnostics,
-        "method_evidence": methods,
-        "method_evidence_origin": method_origin,
-        "method_evidence_packet": state.get("method_evidence_packet"),
-        "parent_candidate_id": spec.get("parent_candidate_id"),
-        "control_candidate_id": spec.get("control_candidate_id") or "baseline",
+        "parent_candidate_id": parent,
+        "control_candidate_id": control,
         "parent_source": candidate_context(camp, parent),
-        "control_source": candidate_context(camp, control),
-        "analyses": load_analysis_views(camp, state, target=parent,
-            sources_by_evidence_id=sources_by_evidence_id, artifacts_by_id=artifacts_by_id),
-        "cold_start_prior": diagnostics is None,
         "capability_status_semantics": "available=wired and usable; verified=false=no execution receipt yet, not missing",
         "evaluation_contract": {
             "fingerprint": contract.get("fingerprint"),
@@ -1841,43 +1801,19 @@ def _design_context(camp: Path, state: dict[str, Any], spec: dict[str, Any]) -> 
             "primary_metric": contract.get("primary_metric"),
         },
         "capabilities": capability_manifest(load_protocol(camp)),
-        "budget": budget_snapshot(camp, state),
-        "measured_parameter_counts": measured_parameter_counts(camp),
-        "missing_inputs": missing,
+        "measured_parameter_counts": counts,
+        "missing_inputs": [] if contract else ["evaluation_contract"],
     })
-    if method_parent is not None:
-        context.update(method_suite=method_parent["aggregate"],
-            method_suite_identity={key: method_parent.get(key) for key in (
-                "evidence_id", "suite_id", "suite_ref", "suite_hash", "method_revision",
-                "source_hash", "result_hash", "contract_fingerprint")},
-            scientific_unit="one_complete_method_suite_seed0")
-    elif screening_parent is not None:
-        context.update(method_screening=screening_parent["screening"], scope="two_fold_development",
-            science_scope=screening_parent.get("science_scope"), scientific_unit="fixed_two_fold_development_seed0",
-            method_screening_identity={key: screening_parent.get(key) for key in (
-                "evidence_id", "suite_id", "suite_ref", "suite_hash", "method_revision", "source_hash", "result_hash")})
-    memory_experiment = spec
-    from .research_execution import single_plan_enabled
-    if single_plan_enabled(camp):
-        from .selected_plan import load_plan
-        selected = load_plan(camp, state)
-        if selected:
-            context["selected_research_task"] = {"plan_id": selected["plan_id"],
-                **{key: selected["proposal"][key] for key in ("question", "task_description", "scientific_intent",
-                    "evaluation_scope", "expected_observation", "completion_condition")}}
-            # Bind retrieval to this task without changing the design spec.
-            memory_experiment = {**spec, "evaluation_scope": selected["proposal"]["evaluation_scope"]}
-            # Separate key: selected_research_task is compared verbatim in review revalidation.
-            from .planning_context import selection_basis
-            basis = selection_basis(camp, selected)
-            if basis is not None:
-                context["selection_basis"] = basis
-    from react_agent.eeg_research.agentic.semantic_memory import role_memory, standalone_delivery
-    bundle = role_memory(camp, state=state, experiment=memory_experiment, role="experiment_designer")
-    if bundle is not None:
-        delivery = standalone_delivery(bundle)
-        if delivery is not None:
-            context["retrieved_memory"] = delivery
+    if selected:
+        context["selected_research_task"] = {"plan_id": selected["plan_id"],
+            **{key: selected["proposal"][key] for key in (
+                "task_kind", "parent_ref", "question", "task_description", "scientific_intent",
+                "evaluation_scope", "expected_observation", "completion_condition")
+               if key in selected["proposal"]}}
+        comparison_ids = selected["proposal"].get("comparison_observation_ids") or []
+        if comparison_ids:
+            from .analysis_context import comparison_target_context
+            context["selected_research_task"]["comparison_targets"] = comparison_target_context(camp, comparison_ids)
     return context
 
 
@@ -1911,6 +1847,14 @@ def _design_experiment(camp: Path, state: dict[str, Any], decision: dict[str, An
         parent_id = str(spec.get("parent_candidate_id") or "baseline")
         parent_config = ({"target_id": "baseline", **BASELINE_HOOK_SPEC} if parent_id == "baseline"
                          else load_approved_binding(camp, parent_id) or {})
+        if parent_id == "baseline":
+            from .execution_protocol import training_recipe
+            from .jobs import baseline_manifest
+            parent_config["source_hash"] = ((context.get("parent_source") or {}).get("source_hash")
+                                             or baseline_manifest()["entry_sha256"])
+            protocol = load_protocol(camp)
+            if protocol is not None:
+                parent_config["training"] = training_recipe(protocol)
         context["design_contract_version"] = "v2"
         context["parent_hook_config"] = parent_config
         if parent_id != "baseline":
@@ -2138,12 +2082,12 @@ def _repair_candidate(camp: Path, state: dict[str, Any], services: Services) -> 
     implementer(camp, state)
 
 
-def _collect_diagnostics(camp: Path, state: dict[str, Any]) -> None:
+def _collect_diagnostics(camp: Path, state: dict[str, Any], request: dict | None = None) -> None:
     from .suite_diagnostics import collect
-    row = collect(camp, state)
+    row = collect(camp, state, request=request)
     _append_derived(state, row)
     if not row["new_information"]:
-        state["last_local_result"] = {"kind": row["kind"], "new_information": False,
+        state["last_local_result"] = {**row, "new_information": False,
                                       "same_as": row["evidence_id"], "reason": "same_verified_source_epoch"}
 
 
@@ -2498,6 +2442,10 @@ def _implement_inline(camp: Path, state: dict[str, Any], decision: dict[str, Any
     workspace.mkdir(parents=True, exist_ok=True)
     materialize(camp, workspace, state.get("experiment") or {})
     protocol = load_protocol(camp)
+    training = (state.get("experiment") or {}).get("training")
+    if protocol is not None and training is not None:
+        from .execution_protocol import with_training_recipe
+        protocol = with_training_recipe(protocol, training)
     (workspace / "input_spec.json").write_text(json.dumps(candidate_interface(protocol), ensure_ascii=False, indent=2), encoding="utf-8")
     applied = apply_candidate_patch(workspace, raw.get("relative") or "extension/eeg_candidate.py", content, raw.get("expected_base_hash") or "")
     if not applied.get("ok"):
@@ -2671,6 +2619,8 @@ def _record_job(camp: Path, state: dict[str, Any], record: dict[str, Any]) -> No
         result["experiment_ref"] = result.get("experiment_ref") or frozen.get("approval_ref")
         result["intervention_config_hash"] = result.get("intervention_config_hash") or frozen.get("intervention_config_hash")
         result["run_config_hash"] = result.get("run_config_hash") or frozen.get("run_config_hash")
+        if "training" in frozen:
+            result["training_recipe"] = frozen["training"]
     if result.get("evaluation_valid"):
         result["contract_fingerprint"] = result.get("execution_fingerprint") or state.get("contract_fingerprint")
     from react_agent.eeg_research.agentic.run_context import load_approved_binding
@@ -2870,13 +2820,8 @@ def _launch(
         state["pending_training_seed"] = training_seed
     from .research_execution import single_plan_enabled
     if single_plan_enabled(camp):
-        from .owner_budget import claim_training, current_owner
-        owner = current_owner(camp)
-        allocation = (owner or {}).get("allocated") or {}
-        jobs_bound, gpu_bound = allocation.get("training_jobs"), allocation.get("gpu_seconds")
-        if not jobs_bound or not gpu_bound:
-            raise ValueError("selected_plan_training_bound_missing")
-        claim_training(camp, job_id, float(gpu_bound) / int(jobs_bound))
+        from .owner_budget import claim_training
+        claim_training(camp, job_id)
         _write(job_dir / "controller_launch_intent.json", {
             "job_id": job_id, "candidate_id": candidate_id, "fidelity": fidelity,
             "training_seed": training_seed, "origin_plan_id": (state.get("selected_plan") or {}).get("plan_id"),

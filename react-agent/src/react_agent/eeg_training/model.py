@@ -30,6 +30,7 @@ class EEGProjectLayer(nn.Module):
         self.z_dim = z_dim
         self.c_num = c_num
         self.timesteps = timesteps
+        self.drop_proj = drop_proj
         self.input_dim = c_num * (timesteps[1] - timesteps[0])
         self.model = nn.Sequential(
             nn.Linear(self.input_dim, z_dim),
@@ -62,8 +63,9 @@ class LocalRetrieval(nn.Module):
             self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
             self.softplus = nn.Softplus()
 
-    def forward(self, eeg: torch.Tensor, image: torch.Tensor, image_codes: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return the local loss and within-batch top-1 and top-5."""
+    def forward(self, eeg: torch.Tensor, image: torch.Tensor, image_codes: torch.Tensor | None = None,
+                *, return_loss_terms: bool = False, return_objective_diagnostics: bool = False):
+        """Return local loss/top-1/top-5, optionally with detached loss terms."""
         from react_agent.eeg_training.hooks import compute_objective, scalar_loss
 
         embedding = self.encoder(eeg)
@@ -72,10 +74,12 @@ class LocalRetrieval(nn.Module):
         else:
             scale = self.softplus(self.logit_scale)
         positives = None if image_codes is None else [str(int(value)) for value in image_codes.detach().reshape(-1).tolist()]
-        if self.objective is None:
-            loss = contrastive_loss(embedding, image, scale)
+        result = compute_objective(self.objective, embedding, image, scale, positives,
+                                   return_terms=return_loss_terms, return_diagnostics=return_objective_diagnostics)
+        if return_objective_diagnostics:
+            loss, terms, diagnostics = result
         else:
-            loss = compute_objective(self.objective, embedding, image, scale, positives)
+            loss, terms = result if return_loss_terms else (result, {})
         # Validate the objective on each replica before DataParallel gathers losses.
         loss = scalar_loss(loss)
         eeg_n = embedding / embedding.norm(dim=-1, keepdim=True)
@@ -85,7 +89,9 @@ class LocalRetrieval(nn.Module):
         top1 = (similarity.argmax(dim=-1) == labels).float().mean()
         picked = similarity.topk(min(5, similarity.shape[1]), dim=-1).indices
         top5 = (picked == labels[:, None]).any(dim=-1).float().mean()
-        return loss, top1, top5
+        if return_objective_diagnostics:
+            return loss, top1, top5, terms, diagnostics
+        return (loss, top1, top5, terms) if return_loss_terms else (loss, top1, top5)
 
 
 def contrastive_loss(eeg_z: torch.Tensor, img_z: torch.Tensor, logit_scale: torch.Tensor) -> torch.Tensor:

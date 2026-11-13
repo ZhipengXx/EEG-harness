@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from react_agent.eeg_research.agentic.memory import confirmation
+from .comparison import meets_gain_threshold
 
 
 def _tier(fidelity: str | None, confirmation_level: str | None) -> str:
@@ -121,7 +122,7 @@ def promotion_decision(
                     and type(delta) in (int, float) and math.isfinite(delta))
         bar = goal.get("min_practical_gain_pp")
         return {"status": "incomplete_method_evidence" if not complete else
-                "development_improvement" if bar is not None and delta >= bar else "development_negative",
+                "development_improvement" if bar is not None and meets_gain_threshold(delta, bar) else "development_negative",
                 "scope": "method_development_benchmark", "paired_complete_suites": 1 if complete else 0,
                 "independent_seed_count": 1 if complete else 0, "replicated": False,
                 "statistical_significance": "not_established", "delta_pp": delta if complete else None}
@@ -184,7 +185,7 @@ def promotion_decision(
             "confirmation_target_pairs": target_pairs,
             "paired_n": replicate_n,
         }
-    if not deltas and bar is not None and delta_pp is not None and float(delta_pp) < float(bar):
+    if not deltas and bar is not None and delta_pp is not None and not meets_gain_threshold(float(delta_pp), float(bar)):
         return {
             "status": "below_threshold",
             "reason": "min_practical_gain_not_met",

@@ -14,7 +14,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .approved_design_context import project_approved_design
+from .approved_design_context import current_implementation_audit_issues, project_approved_design
 from .context.representations import without_local_paths
 from .context.types import canonical, digest
 from .designer_context import _expanded
@@ -115,7 +115,7 @@ def _freeze_source(alias: str, supplied: dict, *, fallback_path: str = "",
     full = text == source
     wire = {"source_ref": alias, "file": Path(native_path).name if native_path else alias,
         "delivery": "full" if full else "selected_source",
-        "segments": [{key: item[key] for key in ("start_line", "end_line", "text")} for item in segments]}
+        "segments": [_segment_view(alias, item, selected=not full) for item in segments]}
     native = {"kind": "source", "native_path": native_path, "sha256": actual_hash,
         "source": text, "full_source": source, "segments": segments,
         "symbol_spans": _symbols(source), "delivered_ranges": ranges, "full": full}
@@ -126,6 +126,14 @@ def _freeze_source(alias: str, supplied: dict, *, fallback_path: str = "",
         if resolve_evidence_reference(alias + "::" + symbol, {"evidence": {alias: native}})]
     wire["line_ranges"] = copy.deepcopy(ranges)
     return wire, native
+
+
+def _segment_view(alias: str, segment: dict, *, selected: bool) -> dict:
+    result = {key: segment[key] for key in ("start_line", "end_line", "text")}
+    ranges = segment["complete_line_ranges"]
+    if selected and ranges:
+        result["line_ref"] = f"{alias}:{ranges[0][0]}"
+    return result
 
 
 def _check_refs(facts: dict) -> list[str]:
@@ -162,8 +170,21 @@ def _clean_checks(checks: dict) -> dict:
             multigpu.pop(name, None)
         data = multigpu.get("result")
         if isinstance(data, dict):
-            for name in ("file", "source_sha256", "probe_identity"):
+            if isinstance(data.get("gpu"), list):
+                data.setdefault("device_count", len(data["gpu"]))
+            inventory = data.get("gpu_inventory")
+            if data.get("ok") is not True and isinstance(inventory, list):
+                properties = [{key: row[key] for key in ("name", "total_memory_mib", "compute_capability") if key in row}
+                              for row in inventory if isinstance(row, dict)]
+                if any(properties):
+                    data["device_properties"] = [row for row in properties if row]
+            # Runtime identity remains in native_checks. Batch partition,
+            # precision and measured round-trip outcomes remain visible. A
+            # failing probe also retains diagnostic device/framework properties.
+            for name in ("file", "source_sha256", "probe_identity", "gpu", "gpu_inventory", "python", "checkpoint_sha256"):
                 data.pop(name, None)
+            if data.get("ok") is True:
+                data.pop("torch", None)
     return result
 
 
@@ -175,6 +196,8 @@ def _runtime_contract(payload: dict, experiment: dict) -> dict:
     if isinstance(multigpu, dict):
         for name in ("execution_fingerprint", "selection_manifest_hash", "protocol_fingerprint"):
             multigpu.pop(name, None)
+        if isinstance(multigpu.get("gpu"), list):
+            multigpu.setdefault("device_count", len(multigpu.pop("gpu")))
     guarantees = interface.pop("runtime_guarantees", None)
     explicit = payload.get("runtime_guarantees")
     if guarantees is not None and explicit is not None and guarantees != explicit:
@@ -218,26 +241,18 @@ def _issues(payload: dict, spec: dict) -> list[dict]:
     return result
 
 
-def _relevant_context(payload: dict, spec: dict) -> dict:
+def _relevant_context(payload: dict, spec: dict, *, candidate_id: str | None = None) -> dict:
     items = []
-    memory = spec.get("retrieved_memory") or payload.get("retrieved_memory") or {}
-    if isinstance(memory, dict):
-        # Real lesson rows stay literal. Retrieval machinery is not lesson text.
-        items.extend(copy.deepcopy(memory.get("items") or []))
-    elif isinstance(memory, list):
-        items.extend(copy.deepcopy(memory))
-    for name in ("audit_issues", "current_user_instruction"):
-        value = spec.get(name)
-        if value:
-            items.append({"kind": name, "content": copy.deepcopy(value)})
+    issues = current_implementation_audit_issues(spec, candidate_id=candidate_id)
+    if issues:
+        items.append({"kind": "audit_issues", "content": issues})
+    if spec.get("current_user_instruction"):
+        items.append({"kind": "current_user_instruction", "content": copy.deepcopy(spec["current_user_instruction"])})
     hints = payload.get("relevant_implementation_hints")
     if hints:
         items.append({"kind": "implementation_hints", "content": copy.deepcopy(hints)})
-    snapshot = payload.get("working_snapshot") or {}
-    if isinstance(snapshot, dict):
-        for name in ("engineering_failures", "open_questions"):
-            if snapshot.get(name):
-                items.append({"kind": name, "content": copy.deepcopy(snapshot[name])})
+    # Current repair issues already have explicit review targets. A broad
+    # snapshot or experimental memory is not additional implementation input.
     return {"items": items, "status": "available" if items else "no_related_context"}
 
 
@@ -348,6 +363,8 @@ def prepare_review_input(native_payload: dict[str, Any]) -> tuple[dict, dict]:
         if identifier in locations:
             row["implementation_locations"] = _alias_locations(locations[identifier], evidence)
         targets[alias] = row
+    requirement_refs = {target["requirement"]["requirement_id"]: ref
+                        for ref, target in roster.items() if target["kind"] == "requirement"}
     previous_issues = {}
     for index, issue in enumerate(_issues(payload, spec), 1):
         issue_ref, target_ref = "i" + str(index), "f" + str(index)
@@ -359,6 +376,33 @@ def prepare_review_input(native_payload: dict[str, Any]) -> tuple[dict, dict]:
             for key in ("title", "detail", "reason", "smallest_correction", "validation_expectation",
                         "requirement_id", "requirement_ids", "code_locations", "source_refs", "evidence_refs") if key in issue}}
         targets[target_ref] = _alias_locations(targets[target_ref], evidence)
+        # A prior defect and the complete requirement are related judgments,
+        # never interchangeable verdicts. Share only literal background; the
+        # frozen native roster and separate r/f output keys remain unchanged.
+        related = list(dict.fromkeys(requirement_refs[identifier]
+            for identifier in [issue.get("requirement_id"), *(issue.get("requirement_ids") or [])]
+            if identifier in requirement_refs))
+        if related:
+            target = targets[target_ref]
+            target["related_requirement_refs"] = related
+            for ref in related:
+                targets[ref].setdefault("related_issue_targets", []).append(target_ref)
+            for key in ("title", "detail", "reason", "smallest_correction", "validation_expectation"):
+                for ref in related:
+                    if key in target and target[key] == targets[ref].get("expected_behavior"):
+                        target.setdefault("shared_context_refs", {})[key] = "/review_targets/" + ref + "/expected_behavior"
+                        target.pop(key)
+                        break
+            # Stable IDs are bound locally; known relations use the short
+            # current-request aliases. Preserve any unmatched historical ID.
+            if target.get("requirement_id") in requirement_refs:
+                target.pop("requirement_id")
+            if "requirement_ids" in target:
+                remaining = [identifier for identifier in target["requirement_ids"] if identifier not in requirement_refs]
+                if remaining:
+                    target["requirement_ids"] = remaining
+                else:
+                    target.pop("requirement_ids")
     focus = payload.get("review_focus") or {}
     wire = {"reviewer_context_version": VERSION, "approved_design": approved,
         "runtime_contract": _runtime_contract(payload, experiment), "review_targets": targets,
@@ -367,7 +411,8 @@ def prepare_review_input(native_payload: dict[str, Any]) -> tuple[dict, dict]:
         "review_scope": {"mode": payload.get("review_mode") or "full",
                          "check_refs": _check_refs(facts),
                          "affected_requirements": copy.deepcopy(focus.get("affected_requirements") or []) if isinstance(focus, dict) else []},
-        "relevant_context": _relevant_context(payload, spec)}
+        "relevant_context": _relevant_context(payload, spec,
+            candidate_id=source_path.parent.parent.name if source_path else None)}
     evidence["parameters"] = {"kind": "parameters", "facts": copy.deepcopy(wire["parameter_facts"]),
                               "source_hash": identity["source_hash"]}
     context = {"contract_version": CONTRACT_VERSION, "input_version": VERSION, "roster": roster,
@@ -426,7 +471,7 @@ def bind_review_delivery(prepared_payload: dict, native_context: dict, *, system
     for row in actual["source_materials"]:
         alias = row["source_ref"]
         frozen = context["evidence"][alias]
-        if row["segments"] != [{key: segment[key] for key in ("start_line", "end_line", "text")}
+        if row["segments"] != [_segment_view(alias, segment, selected=not frozen["full"])
                                for segment in frozen["segments"]]:
             raise ValueError("review_delivery_source_changed")
         frozen["delivered_ranges"] = [pair for segment in frozen["segments"]

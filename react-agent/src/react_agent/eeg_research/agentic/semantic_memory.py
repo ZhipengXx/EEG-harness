@@ -71,11 +71,11 @@ def require_eeg_campaign(camp: Path) -> None:
 class SidecarStore:
     """Short independent transactions; no model encoding occurs under a write lock."""
 
-    def __init__(self, camp: Path):
+    def __init__(self, camp: Path, *, path: Path | None = None):
         self.camp = Path(camp)
         self.namespace = self.camp.name
         require_eeg_campaign(self.camp)
-        self.path = self.camp / "semantic_memory.sqlite"
+        self.path = Path(path) if path is not None else self.camp / "semantic_memory.sqlite"
         with self.connect() as conn:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS skills (
@@ -258,6 +258,25 @@ def build_context(camp: Path, *, state: dict | None = None, experiment: dict | N
         context["modality"] = "EEG"
     if protocol.get("exp_setting"):
         context["regime"] = protocol["exp_setting"]
+    if protocol.get("evaluation_mode", "single_target") == "single_target":
+        from .execution_protocol import training_recipe
+        from .run_context import load_approved_binding
+        target = str(experiment.get("candidate_id") or experiment.get("target_candidate_ref")
+                     or state.get("candidate_id") or "baseline")
+        if target == "baseline":
+            recipe = (training_recipe(protocol) if all(key in protocol for key in
+                      ("full_epochs", "lr", "batch_size")) else None)
+        else:
+            binding = load_approved_binding(camp, target) or {}
+            recipe = binding.get("training")
+            if not isinstance(recipe, dict):
+                expected_spec = binding.get("spec_hash") or experiment.get("spec_hash")
+                recipe = next((row["training_recipe"] for row in reversed(state.get("evidence") or [])
+                    if row.get("candidate_id") == target and row.get("evaluation_valid") is True
+                    and isinstance(row.get("training_recipe"), dict)
+                    and (expected_spec is None or row.get("spec_hash") == expected_spec)), None)
+        if isinstance(recipe, dict):
+            context["training_recipe"] = dict(recipe)
     if goal.get("evaluation_schedule") == "screen_then_confirm":
         from react_agent.eeg_research.agentic.method_suite import manifest, validate_suite
         common = manifest(camp)
@@ -304,33 +323,33 @@ def build_query(camp: Path, *, state: dict | None = None, experiment: dict | Non
                    if isinstance(qid, str) and any(row["question_id"] == qid for row in questions)), None)
     selected = [row for row in questions if row["question_id"] == active] if active else questions[:3]
     question_lines = list(dict.fromkeys(
-        row["text"].strip()[:250] + (" — " + row["note"][:100] if isinstance(row.get("note"), str) else "")
+        row["text"].strip() + (" — " + row["note"] if isinstance(row.get("note"), str) else "")
         for row in selected if row["text"].strip()))
     sections = []
     if question_lines:
         label = "Current plan question" if active else "Unresolved plan questions (no active selection)"
-        sections.append((label + ": " + "\n".join(question_lines))[:1100])
-    sections.append(("Objective: " + str(goal.get("objective") or ""))[:800])
+        sections.append(label + ": " + "\n".join(question_lines))
+    sections.append("Objective: " + str(goal.get("objective") or ""))
     parts = []
     if isinstance(hypothesis, str):
         parts.append(hypothesis)
     elif isinstance(hypothesis, dict):
         parts.extend(str(hypothesis[k]) for k in ("question", "statement", "mechanism", "prediction", "intervention") if hypothesis.get(k))
     if parts:
-        sections.append(("Hypothesis: " + "\n".join(dict.fromkeys(parts)))[:1100])
+        sections.append("Hypothesis: " + "\n".join(dict.fromkeys(parts)))
     targets = {str(experiment[k]) for k in ("parent_candidate_id", "control_candidate_id") if experiment.get(k)}
     facts = verified_diagnostic_facts(camp, state, target_ids=targets or None, max_facts=3)
     diagnoses = []
     for fact in facts:
         diagnostic = {k: fact[k] for k in ("representation", "mean_direction_norm", "mean_margin", "realized_training") if fact.get(k) is not None}
         if diagnostic and not unsafe_source(diagnostic):
-            diagnoses.append(canonical(diagnostic)[:210])
+            diagnoses.append(canonical(diagnostic))
     if diagnoses:
-        sections.append(("Verified development diagnosis: " + "\n".join(dict.fromkeys(diagnoses)))[:700])
+        sections.append("Verified development diagnosis: " + "\n".join(dict.fromkeys(diagnoses)))
     context = build_context(camp, state=state, experiment=experiment)
     scope = {key: context[key] for key in ("modality", "regime", "dataset") if key in context}
     if scope:
-        sections.append(("Verified task scope: " + canonical(scope))[:200])
+        sections.append("Verified task scope: " + canonical(scope))
     action = state.get("last_action") or state.get("action") or ""
     error = state.get("error") or state.get("block_reason") or ""
     return prepare_query(question="\n".join(dict.fromkeys(section for section in sections if section.strip())),
@@ -338,9 +357,8 @@ def build_query(camp: Path, *, state: dict | None = None, experiment: dict | Non
         identities=[experiment.get("candidate_id"), state.get("active_question_id")])["text"]
 
 
-def planner_query(camp: Path, observation: dict) -> str:
+def planner_query(camp: Path, observation: dict, *, verified_sources: dict | None = None) -> dict:
     """Prioritize the current question, mechanism and latest native feedback."""
-    from .context.retrieval import prepare_query
     from .experiment_observations import ExperimentObservationStore
 
     selected = observation.get("selected_research_task") or (observation.get("selected_plan") or {}).get("proposal") or {}
@@ -351,33 +369,46 @@ def planner_query(camp: Path, observation: dict) -> str:
     if terminal:
         # Use the same verified native source as observation delivery, rather
         # than letting a generic objective displace the just-completed question.
-        records = ExperimentObservationStore(Path(camp)).records(observation_id=str(terminal), limit=1)
+        records = ExperimentObservationStore(Path(camp), verified_sources=verified_sources).records(
+            observation_id=str(terminal), limit=1)
         original = records[0]["body"] if records else {}
-    question = (observation.get("current_question") or selected.get("question")
-                or original.get("question")
-                or (hypothesis.get("question") if isinstance(hypothesis, dict) else None)
-                or build_query(camp, state=observation, experiment=experiment))
-    mechanism = (hypothesis.get("mechanism") or hypothesis.get("intended_intervention")
-                 if isinstance(hypothesis, dict) else hypothesis) or selected.get("scientific_intent") or experiment.get("intervention") or original.get("intervention")
+    if selected:
+        question = selected.get("question") or observation.get("current_question") or ""
+        mechanism = selected.get("scientific_intent") or selected.get("task_description") or selected.get("method") or ""
+    elif original:
+        question = original.get("question") or ""
+        mechanism = original.get("intervention") or ""
+    else:
+        question = (observation.get("current_question")
+                    or (hypothesis.get("question") if isinstance(hypothesis, dict) else None)
+                    or build_query(camp, state=observation, experiment=experiment))
+        mechanism = (hypothesis.get("mechanism") or hypothesis.get("intended_intervention")
+                     if isinstance(hypothesis, dict) else hypothesis) or experiment.get("intervention")
     feedback = ""
     if original:
         failure = original.get("engineering_failure") or {}
         facts = original.get("native_facts") or {}
         parts = ["status=" + str(original.get("execution_status"))]
         if failure.get("error_category"):
-            parts.append("category=" + str(failure["error_category"])[:60])
+            parts.append("category=" + str(failure["error_category"]))
         issue = next((row for row in failure.get("blocking_issues") or [] if isinstance(row, dict)), {})
-        parts.extend(key + "=" + str(issue[key])[:80]
+        parts.extend(key + "=" + str(issue[key])
                      for key in ("requirement_id", "error_class", "kind") if issue.get(key))
         if facts.get("metrics"):
-            parts.append(canonical({key: facts[key] for key in ("metrics", "paired_delta_pp", "seed", "coverage") if key in facts})[:180])
+            parts.append(canonical({key: facts[key] for key in ("metrics", "paired_delta_pp", "seed", "coverage") if key in facts}))
         feedback = " ".join(parts)
-    # retrieve() subsequently applies a 600-character encoding view. Allocate
-    # that view here so feedback and mechanism survive even a huge question.
-    sections = [("Feedback", feedback, 220), ("Question", question, 180), ("Mechanism", mechanism, 140)]
-    text = "\n".join(label + ": " + value.strip()[:limit]
-                     for label, value, limit in sections if isinstance(value, str) and value.strip())
-    return prepare_query(question=text, max_chars=600)["text"]
+    # Keep original fields until the backend applies its actual token limit.
+    return {"feedback": feedback, "question": question, "method": mechanism}
+
+
+def prepare_retrieval_query(backend, query: str | dict) -> dict:
+    """Reuse a prepared card across retrieval channels without rewrapping it."""
+    if isinstance(query, dict) and "text" in query and "metadata" in query:
+        return copy.deepcopy(query)
+    if hasattr(backend, "prepare_query"):
+        return backend.prepare_query(query)
+    fields = query if isinstance(query, dict) else {"question": query}
+    return prepare_query(**fields)
 
 
 def _search_text(kind: str, body: dict) -> str:
@@ -587,60 +618,96 @@ def index_records(store: SidecarStore, records: list[dict], backend, *, rebuild:
     return stats
 
 
-def retrieve_proposal_observations(camp: Path, proposals: list[dict], *, context: dict | None = None) -> dict:
+def retrieve_proposal_observations(camp: Path, proposals: list[dict], *, context: dict | None = None,
+                                  delivered_observations: dict | None = None,
+                                  verified_sources: dict | None = None) -> dict:
     """One index sync and one query batch for all alternatives, with no LLM.
 
     Rank publication-frozen records first. Validate only selected detail records,
     once per union, so an old relevant experiment does not entail replaying every
     experiment's training evidence. Scientific delivery is budgeted by the caller.
     """
-    from .experiment_observations import ExperimentObservationStore
+    from .experiment_observations import ExperimentObservationStore, related_diagnostic_records
 
     config = memory_config(camp)
-    result = {"by_proposal": {row["proposal_id"]: [] for row in proposals}, "status": "disabled"}
-    if not config.enabled:
-        return result
-    source = ExperimentObservationStore(camp)
-    records = _observation_search_records(source, context)
-    if not records:
-        return {**result, "status": "empty"}
-    backend = backend_for(config)
-    store = source.sidecar
-    stats = index_records(store, records, backend)
-    if stats["failed"]:
-        raise EmbeddingUnavailable(stats["reason"])
-    queries = [prepare_query(question=str(row.get("question") or "") + "\nRationale: " +
-                             str(row.get("scientific_intent") or ""),
-                             method=row.get("task_description"))["text"] for row in proposals]
-    prepared = [(backend.prepare_query(query) if hasattr(backend, "prepare_query")
-                 else prepare_query(question=query)) for query in queries]
-    vectors, metadata = backend.encode([row["text"] for row in prepared])
-    if len(vectors) != len(proposals) or len(metadata) != len(proposals) or any(row.get("truncated") for row in metadata):
-        raise EmbeddingUnavailable("proposal_query_encoding_incomplete")
-    priorities = {"compatible_evidence": 0, "preconditions_met": 1, "analogy_only": 2,
-                  "preconditions_mismatch": 2, "applicability_unknown": 3, "preconditions_unknown": 3}
+    result = {"by_proposal": {row["proposal_id"]: [] for row in proposals},
+              "priority_ids_by_proposal": {row["proposal_id"]: [] for row in proposals}, "status": "disabled"}
+    source = ExperimentObservationStore(camp, verified_sources={} if verified_sources is None else verified_sources)
+    records = _observation_search_records(source, context) if config.enabled else []
     ranked = [[] for _ in proposals]
-    for record in records:
-        chunks = [store.cached(chunk, backend.fingerprint, backend.metadata)
-                  for chunk in record.get("embedding_chunks", [record])]
-        for index, query_vector in enumerate(vectors):
-            scores = [float(vector @ query_vector) for vector in chunks if vector is not None]
-            if scores and max(scores) >= config.min_similarity:
-                ranked[index].append((priorities.get(record.get("applicability"), 3), -max(scores),
-                                      record["record_id"]))
-    verified = {}
-    for proposal, matches in zip(proposals, ranked):
-        hits = result["by_proposal"][proposal["proposal_id"]]
-        for _, negative_score, observation_id in sorted(matches):
-            if len(hits) >= max(0, min(config.top_k, 5)):
-                break
-            if observation_id not in verified:
+    stats = {"indexed": 0, "reused": 0, "pending": 0, "failed": 0}
+    if records:
+        backend = backend_for(config)
+        store = source.sidecar
+        stats = index_records(store, records, backend)
+        if stats["failed"]:
+            raise EmbeddingUnavailable(stats["reason"])
+        queries = [{"question": str(row.get("question") or "") + "\nRationale: " +
+                    str(row.get("scientific_intent") or ""), "method": row.get("task_description")}
+                   for row in proposals]
+        prepared = [prepare_retrieval_query(backend, query) for query in queries]
+        vectors, metadata = backend.encode([row["text"] for row in prepared])
+        if len(vectors) != len(proposals) or len(metadata) != len(proposals) or any(row.get("truncated") for row in metadata):
+            raise EmbeddingUnavailable("proposal_query_encoding_incomplete")
+        priorities = {"compatible_evidence": 0, "preconditions_met": 1, "analogy_only": 2,
+                      "preconditions_mismatch": 2, "applicability_unknown": 3, "preconditions_unknown": 3}
+        for record in records:
+            chunks = [store.cached(chunk, backend.fingerprint, backend.metadata)
+                      for chunk in record.get("embedding_chunks", [record])]
+            for index, query_vector in enumerate(vectors):
+                scores = [float(vector @ query_vector) for vector in chunks if vector is not None]
+                if scores and max(scores) >= config.min_similarity:
+                    ranked[index].append((priorities.get(record.get("applicability"), 3), -max(scores),
+                                          record["record_id"]))
+    verified, validated_count, reused_count = {}, 0, 0
+
+    def resolve(observation_id):
+        nonlocal validated_count, reused_count
+        if observation_id not in verified:
+            frozen = (delivered_observations or {}).get(observation_id)
+            if frozen is not None:
+                # One frozen scientific body is shared by both stages.
+                verified[observation_id] = {"record_type": "experiment_observation",
+                    "record_id": observation_id, "body": copy.deepcopy(frozen),
+                    "current_feedback": bool(frozen.get("current_feedback"))}
+                reused_count += 1
+            else:
                 rows = source.records(limit=1, observation_id=observation_id, context=context)
                 verified[observation_id] = rows[0] if rows else None
-            if verified[observation_id] is not None:
-                hits.append({**verified[observation_id], "cosine_score": -negative_score})
-    return {**result, "status": "ready", "indexing": stats,
-            "candidate_count": len(records), "validated_count": len(verified)}
+                validated_count += 1
+        return verified[observation_id]
+
+    for proposal, matches in zip(proposals, ranked):
+        hits = result["by_proposal"][proposal["proposal_id"]]
+        explicit = [identity for field in ("basis_observation_ids", "comparison_observation_ids")
+                    for identity in proposal.get(field) or []]
+        targets = {proposal.get("parent_ref"), proposal.get("target_candidate_ref")} - {None, "baseline"}
+        for target in sorted(targets):
+            parent = next((row for row in records if (row["body"].get("identity") or {}).get("candidate_id") == target
+                           and not (row["body"].get("native_facts") or {}).get("measurement_kind")), None)
+            if parent:
+                explicit.append(parent["record_id"])
+        explicit.extend(row["record_id"] for row in related_diagnostic_records(records, targets, context=context,
+            known_observations=[row["body"] for row in records])[:max(0, min(config.top_k, 5))])
+        priority = result["priority_ids_by_proposal"][proposal["proposal_id"]]
+        for observation_id in dict.fromkeys(explicit):
+            record = resolve(observation_id)
+            if record is not None:
+                hits.append(record)
+                priority.append(observation_id)
+        optional_count = 0
+        for _, negative_score, observation_id in sorted(matches):
+            if optional_count >= max(0, min(config.top_k, 5)):
+                break
+            if observation_id in priority:
+                continue
+            record = resolve(observation_id)
+            if record is not None:
+                hits.append({**record, "cosine_score": -negative_score})
+                optional_count += not bool(record.get("current_feedback"))
+    return {**result, "status": "ready" if records or any(result["by_proposal"].values())
+            else "empty" if config.enabled else "disabled", "indexing": stats,
+            "candidate_count": len(records), "validated_count": validated_count, "reused_count": reused_count}
 
 
 def _delivery_fields(bundle: dict, *, standalone: bool = False) -> dict:
@@ -694,13 +761,14 @@ def _finalize_bundle(bundle: dict) -> dict:
     return bundle
 
 
-def retrieve(camp: Path, query: str | None = None, *, state: dict | None = None,
+def retrieve(camp: Path, query: str | dict | None = None, *, state: dict | None = None,
              experiment: dict | None = None, config: MemoryConfig | None = None,
              require_embedding: bool = False, rebuild: bool = False,
              role: str = "research_planner", context: dict | None = None,
-             record_types: frozenset[str] | None = None) -> dict:
+             record_types: frozenset[str] | None = None, verified_sources: dict | None = None,
+             exclude_record_ids=()) -> dict:
     config = config or memory_config(camp)
-    query = build_query(camp, state=state, experiment=experiment) if query is None else prepare_query(question=query)["text"]
+    query = build_query(camp, state=state, experiment=experiment) if query is None else query
     bundle = {"backend": "disabled", "degraded": False, "reason": "disabled", "query": query,
               "items": [], "lessons": {k: [] for k in GROUPS}, "candidate_count": 0, "hit_count": 0,
               "model": config.model_id, "revision": config.model_revision, "fingerprint": None,
@@ -734,14 +802,14 @@ def retrieve(camp: Path, query: str | None = None, *, state: dict | None = None,
                       revision=backend.metadata["model_revision"], fingerprint=backend.fingerprint,
                       text_builder_version=TEXT_BUILDER_VERSION, indexing=stats,
                       candidate_count=len(records), language_limit="Original lesson language; no translation. MiniLM is English-focused.")
+        query_card = prepare_retrieval_query(backend, query)
+        query = query_card["text"]
+        bundle["query"] = query
+        bundle["query_representation"] = query_card["metadata"]
         if not query.strip():
             bundle["query_status"] = "empty_index_only"
             return _finalize_bundle(bundle)
-        query_card = backend.prepare_query(query) if hasattr(backend, "prepare_query") else prepare_query(question=query)
-        query = query_card["text"]
-        bundle["query"] = query
         bundle["query_sha256"] = hashlib.sha256(query.encode()).hexdigest()
-        bundle["query_representation"] = query_card["metadata"]
         query_hash = hashlib.sha256(query.encode()).hexdigest()
         query_record = {"record_type": "query", "record_id": "query_" + query_hash[:24], "version": TEXT_BUILDER_VERSION,
                         "content_hash": query_hash, "text_hash": query_hash, "search_text": query}
@@ -774,12 +842,15 @@ def retrieve(camp: Path, query: str | None = None, *, state: dict | None = None,
         ranked.sort(key=lambda item: item[:3])
         bundle["matched_count"] = len(ranked)
         observation_store = None
+        excluded = set(exclude_record_ids)
         for _, _, _, row, score in ranked:
+            if row["record_id"] in excluded:
+                continue
             if len(bundle["items"]) >= max(0, min(config.top_k, 32)):
                 break
             if row["record_type"] == "experiment_observation":
                 from .experiment_observations import ExperimentObservationStore
-                observation_store = observation_store or ExperimentObservationStore(camp)
+                observation_store = observation_store or ExperimentObservationStore(camp, verified_sources=verified_sources)
                 verified = observation_store.records(limit=1, observation_id=row["record_id"], context=context)
                 if not verified:
                     continue
@@ -874,25 +945,19 @@ def apply_memory(request: dict, bundle: dict) -> dict:
 
 def role_memory(camp: Path, *, state: dict | None = None, experiment: dict | None = None,
                 role: str = "research_planner", record_types: frozenset[str] | None = None) -> dict | None:
+    # Research history is a decision input, not a default attachment to every
+    # stage. Engineering repairs use their existing candidate-bound mechanism.
+    allowed = ({"experiment_observation", "lesson", "knowledge"}
+               if role in {"research_planner", "research_critic"} else
+               {"skill"} if role == "memory_curator" else set())
+    selected_types = allowed if record_types is None else allowed.intersection(record_types)
+    if not selected_types:
+        return None
     config = memory_config(camp)
     if not config.enabled:
         return None
-    retrieval_state = state
-    context = {}
-    if role == "experiment_designer" and experiment is not None:
-        scope = experiment.get("evaluation_scope") or {}
-        # The selected task may differ from the previous execution phase.
-        # Keep this override local to design retrieval; later roles use execution state.
-        if scope.get("phase"):
-            retrieval_state = {**(state if state is not None else read_json(camp / "campaign_state.json")),
-                               "phase": scope["phase"]}
-        folds = scope.get("folds")
-        if isinstance(folds, list):
-            context.update(fold_ids=list(folds), fold_count=len(folds))
-        if scope.get("seed") is not None:
-            context["seed"] = scope["seed"]
-    bundle = retrieve(camp, state=retrieval_state, experiment=experiment, config=config, role=role,
-                      record_types=record_types, context=context)
+    bundle = retrieve(camp, state=state, experiment=experiment, config=config, role=role,
+                      record_types=frozenset(selected_types))
     selected, fields = _fit_delivery(bundle, standalone=True)
     bundle["_delivery_fields"] = fields
     if selected is not None:
@@ -904,48 +969,6 @@ def role_memory(camp: Path, *, state: dict | None = None, experiment: dict | Non
 def standalone_delivery(bundle: dict) -> dict | None:
     """Attach an already selected role view, with every body appearing once."""
     return _selected_delivery(bundle).get("retrieved_memory")
-
-
-def coder_delivery(camp: Path, workspace: Path, attempt_id: str, spec: dict, *, state: dict,
-                   previous_spec: dict, previous_attempt_id: str | None) -> dict | None:
-    from .memory_delivery import PROJECTION_VERSION, memory_content_chars, memory_content_tokens
-
-    config = memory_config(camp)
-    if not config.enabled:
-        return None
-    spec_hash = (spec.get("experiment") or {}).get("spec_hash")
-    def build():
-        bundle = role_memory(camp, state=state, experiment=spec["experiment"], role="candidate_coder")
-        body = standalone_delivery(bundle) if bundle else None
-        return {"spec_hash": spec_hash, "retrieved_memory": body,
-                "projection_version": PROJECTION_VERSION, "content_chars_budget": config.content_chars_budget,
-                "per_observation_tokens_budget": config.per_observation_tokens_budget,
-                "delivery_report": copy.deepcopy((bundle or {}).get("_delivery_report"))}
-    frozen = SidecarStore(camp).freeze("coder:" + workspace.name + ":" + attempt_id, build)
-    if not isinstance(frozen, dict) or "spec_hash" not in frozen or "retrieved_memory" not in frozen:
-        raise ValueError("frozen_memory_payload_invalid")
-    if frozen["spec_hash"] != spec_hash:
-        raise ValueError("frozen_memory_experiment_changed")
-    if frozen.get("projection_version") != PROJECTION_VERSION:
-        raise ValueError("frozen_memory_projection_changed")
-    body = frozen["retrieved_memory"]
-    if body is not None:
-        if not isinstance(body, dict) or not isinstance(body.get("items"), list):
-            raise ValueError("frozen_memory_payload_invalid")
-        stored_budget = frozen["content_chars_budget"]
-        if not isinstance(stored_budget, int) or isinstance(stored_budget, bool) or stored_budget < 0:
-            raise ValueError("frozen_memory_budget_invalid")
-        per_observation = frozen["per_observation_tokens_budget"]
-        size = 0
-        for card in body["items"]:
-            if card.get("record_type") == "experiment_observation":
-                if memory_content_tokens(card)[0] > per_observation and not card.get("current_feedback"):
-                    raise ValueError("frozen_observation_token_budget_exceeded")
-            else:
-                size += memory_content_chars(card, role="candidate_coder")
-        if size > stored_budget:
-            raise ValueError(f"frozen_memory_budget_exceeded:{size}")
-    return body
 
 
 def main(argv=None) -> int:

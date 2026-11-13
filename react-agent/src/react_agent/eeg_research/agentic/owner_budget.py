@@ -1,8 +1,8 @@
 """Opt-in resource owners at the actual provider and native phase boundaries.
 
-Allocation is authority, claims are durable facts. Children partition their
-parent; only top-level unused allocations enter the global admission equation.
-The pre-existing cost/attempt journals are never reset or refunded.
+Owners identify work; claims record individual dispatches and actual usage.
+Planning forecasts never reserve execution capacity. The pre-existing
+cost/attempt journals are never reset or refunded.
 """
 from __future__ import annotations
 
@@ -57,12 +57,32 @@ def _journal(camp, name):
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()] if path.is_file() else []
 
 
+def _permitted_unknown_call_ids(camp):
+    return {row.get("call_id") for row in _journal(Path(camp), "api_unknown_dispositions.jsonl")
+            if row.get("action") == "abandon_response" and row.get("allow_new_request") is True}
+
+
+def _claims_require_reconciliation(camp, claims):
+    """An authorized abandoned response can close; its unknown charge stays occupied."""
+    permitted = None
+    for claim in claims:
+        if claim["status"] in {"claimed", "inflight"}:
+            return True
+        if claim["status"] == "unknown":
+            if permitted is None:
+                permitted = _permitted_unknown_call_ids(camp)
+            if claim["call_id"] not in permitted:
+                return True
+    return False
+
+
 def _native_ids(camp):
     return {str(row["call_id"]) for name in ("llm_calls.jsonl", "llm_api_intents.jsonl", "api_operation_attempts.jsonl") for row in _journal(camp, name) if row.get("call_id")}
 
 
-def _native_used(camp):
-    cost, state = _read(camp / "cost.json"), _read(camp / "campaign_state.json")
+def _native_used(camp, cost=None):
+    cost = _read(camp / "cost.json") if cost is None else cost
+    state = _read(camp / "campaign_state.json")
     result = resources({"llm_calls": max(int(cost.get("llm_calls") or 0), int(state.get("llm_calls") or 0), len(_native_ids(camp))),
         "input_tokens": cost.get("input_tokens") or 0, "output_tokens": cost.get("output_tokens") or 0,
         "total_tokens": (cost.get("input_tokens") or 0) + (cost.get("output_tokens") or 0),
@@ -91,6 +111,15 @@ def _transaction(camp):
             _put(conn, "meta", "baseline", {"used": initial, "call_ids": sorted(_native_ids(camp)),
                 "token_known_counts":coverage,"initial_usage":{key:{field:row.get(field) for field in ("input_tokens","output_tokens","api_usd")} for key,row in native_rows.items()},
                 "usd_priced":isinstance(prior.get("api_usd"),(int,float)),"at":time.time()})
+        if not _get(conn, "meta", "dispatch_accounting"):
+            retired = {}
+            for owner in _all(conn, "owners"):
+                if any(owner["allocated"].values()):
+                    retired[owner["owner_id"]] = owner["allocated"]
+                    owner["allocated"] = resources()
+                    _put(conn, "owners", owner["owner_id"], owner)
+            _put(conn, "meta", "dispatch_accounting", {
+                "retired_forecast_allocations": retired, "at": time.time()})
         yield conn
         conn.execute("COMMIT")
     except BaseException:
@@ -126,49 +155,59 @@ def _remaining(owner):
     return {key: max(0, owner["allocated"][key] - owner["consumed"][key]) if owner["status"] in {"active", "handoff"} else 0 for key in DIMENSIONS}
 
 
-def _available(conn, owner):
-    result = _remaining(owner)
-    for child in _all(conn, "owners"):
-        if child.get("parent_id") == owner["owner_id"]:
-            for key, amount in _remaining(child).items():
-                result[key] -= amount
-    return result
+def _running_gpu_seconds(camp, claim):
+    """Project a dispatched job's elapsed occupancy without inventing a runtime forecast."""
+    if claim["role"] == "training":
+        record = _read(camp / "jobs" / claim["operation_id"] / "job.json")
+        start = record.get("started_at") or claim.get("process_dispatched_at")
+        cards = len(record.get("gpu") or []) or claim.get("n_gpu", 0)
+    else:
+        directory = camp / "engineering_checks" / "multigpu" / claim["operation_id"]
+        record = _read(directory / "process.json")
+        intent, request = _read(directory / "intent.json"), _read(directory / "request.json")
+        start = intent.get("started_at") or claim.get("gpu_child_dispatched_at")
+        cards = len(request.get("gpu") or [])
+    if isinstance(record.get("gpu_seconds"), (int, float)):
+        return record["gpu_seconds"]
+    return max(0.0, (record.get("ended_at") or time.time()) - start) * cards if start and cards else 0.0
 
 
 def _snapshot(conn, camp, owner_id=None):
     baseline = _get(conn, "meta", "baseline")
-    native, claims = _native_used(camp), _all(conn, "claims")
+    cost = _read(camp / "cost.json")
+    native, claims = _native_used(camp, cost), _all(conn, "claims")
     used = dict(native)
     # cost.llm_calls already contains native intents. One id enters once.
     baseline_ids = set(baseline["call_ids"])
     owner_actual = dict(baseline["used"])
     reserved_unknown = resources()
+    unjournaled_gpu = 0.0
+    uncertain_gpu = 0.0
+    settled_jobs = set(cost.get("settled_job_ids") or [])
     for claim in claims:
         if claim["call_id"] in baseline_ids:
             continue
-        actual = claim.get("actual") or resources()
+        actual = dict(claim.get("actual") or resources())
+        committed = dict(claim["committed"])
+        if claim["role"] in {"training", "engineering_probe"}:
+            job_id = claim["operation_id"] if claim["role"] == "training" else "engineering_multigpu_" + claim["operation_id"]
+            if job_id not in settled_jobs:
+                if claim["status"] in {"claimed", "inflight"}:
+                    unjournaled_gpu += _running_gpu_seconds(camp, claim)
+                else:
+                    unjournaled_gpu += actual["gpu_seconds"]
+                    uncertain_gpu += max(0.0, committed["gpu_seconds"] - actual["gpu_seconds"])
+            actual["gpu_seconds"] = committed["gpu_seconds"] = 0
         for key in DIMENSIONS:
             owner_actual[key] += actual[key]
-            native_probe_accounted = claim["role"]=="engineering_probe" and key=="gpu_seconds" and (
-                "engineering_multigpu_"+claim["operation_id"] in (_read(camp/"cost.json").get("settled_job_ids") or []))
-            if not native_probe_accounted:
-                reserved_unknown[key] += max(0, claim["committed"][key] - actual[key])
+            reserved_unknown[key] += max(0, committed[key] - actual[key])
     known = {key:max(used[key],owner_actual[key]) for key in DIMENSIONS}
+    known["gpu_seconds"] += unjournaled_gpu
+    reserved_unknown["gpu_seconds"] += uncertain_gpu
     conservative = dict(reserved_unknown)
     for key in DIMENSIONS:
         used[key] = known[key] + reserved_unknown[key]
-    owners = _all(conn, "owners")
     reserved = resources()
-    for row in owners:
-        if row.get("parent_id") is None:
-            for key, amount in _remaining(row).items():
-                reserved[key] += amount
-    # Legacy phase authority remains effective; attached plan children are
-    # already inside their top-level allocation and are not counted again.
-    for receipt in (_read(camp/"phase_reservations.json").get("receipts") or {}).values():
-        if receipt.get("status")=="active" and not receipt.get("budget_owner"):
-            for key,field in (("llm_calls","remaining_llm_calls"),("training_jobs","remaining_training_jobs"),("gpu_seconds","remaining_gpu_seconds")):
-                reserved[key]+=receipt.get(field) or 0
     goal = _read(camp / "goal.json")
     config = ((goal.get("research_execution") or {}).get("budget") or {})
     cap = {key: goal.get(name) if goal.get(name) is not None else config.get(name) for key, name in CAPS.items()}
@@ -207,8 +246,9 @@ def _snapshot(conn, camp, owner_id=None):
         "unknown":request_view["unknown"],"native_pending_call_ids":request_view["native_pending"], "dimension_units": {"api_usd": "USD", "gpu_seconds": "GPU seconds"}}
     if owner_id:
         row = _get(conn, "owners", owner_id)
-        result["owner_remaining"] = _remaining(row) if row else resources()
-        result["owner_available"] = _available(conn, row) if row else resources()
+        available = unreserved if row and row["status"] in {"active", "handoff"} else resources()
+        result["owner_remaining"] = dict(available)
+        result["owner_available"] = dict(available)
     return result
 
 
@@ -224,7 +264,7 @@ def _fit(request, available, prefix):
 
 
 def _allocate(conn, camp, owner_id, amount, *, kind, parent_id=None, purpose=None, binding=None):
-    identity = {"owner_id": owner_id, "allocated": resources(amount), "kind": kind, "parent_id": parent_id, "purpose": purpose, "binding": binding or {}}
+    identity = {"owner_id": owner_id, "allocated": resources(), "kind": kind, "parent_id": parent_id, "purpose": purpose, "binding": binding or {}}
     old = _get(conn, "owners", owner_id)
     if old:
         if old["status"]=="released":
@@ -237,9 +277,6 @@ def _allocate(conn, camp, owner_id, amount, *, kind, parent_id=None, purpose=Non
         parent = _get(conn, "owners", parent_id)
         if not parent or parent["status"] != "active":
             raise OwnerBudgetError("owner_parent_not_active")
-        _fit(identity["allocated"], _available(conn, parent), "owner_child_unavailable")
-    else:
-        _fit(identity["allocated"], _snapshot(conn, camp)["unreserved_available"], "global_allocation_unavailable")
     row = {**identity, "consumed": resources(), "status": "active", "created_at": time.time()}
     _put(conn, "owners", owner_id, row)
     return row
@@ -369,8 +406,7 @@ def claim_request(camp, *, call_id, operation, role, input_bound, output_bound, 
             return existing
         _control(camp,provider=True)
         snap = _snapshot(conn, camp)
-        dispositions={row.get("call_id") for row in _journal(camp,"api_unknown_dispositions.jsonl")
-            if row.get("action")=="abandon_response" and row.get("allow_new_request") is True}
+        dispositions = _permitted_unknown_call_ids(camp)
         if set(snap["unknown"]).difference(dispositions) or snap["inflight"]:
             raise OwnerBudgetError("unsettled_owner_claim_requires_recovery")
         # Pre-owner native unknowns keep the existing disposition gate.
@@ -390,18 +426,15 @@ def claim_request(camp, *, call_id, operation, role, input_bound, output_bound, 
                 raise OwnerBudgetError("emergency_requires_role_preparation_owner")
             if mode=="batch" and owner_id is not None:
                 raise OwnerBudgetError("batch_requires_unreserved_auxiliary")
-        _check_global_equation(snap)
+        _fit(amount, snap["global_remaining"], "global_request_unavailable")
         if owner_id:
             owner = _get(conn, "owners", owner_id)
-            _fit(amount, _available(conn, owner), "owner_request_unavailable")
             cursor = owner
             while cursor:
                 for key, count in amount.items():
                     cursor["consumed"][key] += count
                 _put(conn, "owners", cursor["owner_id"], cursor)
                 cursor = _get(conn, "owners", cursor["parent_id"]) if cursor.get("parent_id") else None
-        else:
-            _fit(amount, snap["unreserved_available"], "auxiliary_request_deferred")
         priced=frozen_pricing["pricing"] is not None
         row = {"usd_bound_kind":"configured_price" if priced else "conservative" if amount["api_usd"]>0 else "unpriced",
                "frozen_pricing": frozen_pricing,
@@ -544,7 +577,6 @@ def before_transport(camp, *, call_id, role, input_bound, output_bound, provider
         _control(camp,provider=True)
         if _get(conn, "meta", "overrun"):
             raise OwnerBudgetError("provider_budget_overrun_requires_reconciliation")
-        _check_global_equation(_snapshot(conn,camp))
         row = _get(conn, "claims", call_id)
         if not row or row["status"] != "claimed":
             raise OwnerBudgetError("provider_transport_claim_not_sendable")
@@ -611,8 +643,8 @@ def _envelope(camp, task_kind, known_cost, recovery_limits):
     for role, count in roles.items():
         role_output = output_per
         if role in {"candidate_coder", "candidate_reviewer"}:
-            # The common allocation estimate used to be32k. A larger coding
-            # profile must fit its complete output bound before transport.
+            # Planning accounts for the configured output allowance, including
+            # larger coding profiles. Dispatch charges individual requests.
             role_output = max(role_output, resolve_role_config(Path(camp), role).max_tokens)
         role_resources[role] = resources({key: value * count for key, value in
             _request_resources(Path(camp), input_per, role_output).items()})
@@ -652,23 +684,27 @@ def _envelope(camp, task_kind, known_cost, recovery_limits):
     return total, role_resources, continuation, preparation, engineering
 
 
-def allocate_selected_plan(camp, *, plan_id, task_kind, known_cost, recovery_limits):
+def allocate_selected_plan(camp, *, plan_id, task_kind, recovery_limits, known_cost=None):
     camp = Path(camp)
     if not enabled(camp):
         raise OwnerBudgetError("owner_protocol_not_enabled")
-    total, roles, continuation, preparation, engineering = _envelope(camp, task_kind, known_cost, recovery_limits)
+    roles = ("experiment_designer", "candidate_coder", "candidate_reviewer", "result_analyst") if task_kind == "new_method" else ("result_analyst",)
+    config = (_read(camp / "goal.json").get("research_execution") or {}).get("budget") or {}
+    configured = config.get("envelopes") or {}
+    preparation = (configured.get(task_kind) or {}).get("preparation_calls") or {}
     owner_id = "plan:" + plan_id
-    amount = resources({key: total[key] + continuation[key] for key in DIMENSIONS})
     with _transaction(camp) as conn:
         _control(camp)
-        owner = _allocate(conn, camp, owner_id, amount, kind="selected_plan", binding={"plan_id": plan_id, "task_kind": task_kind, "recovery_limits": recovery_limits})
-        for role, budget in roles.items():
-            _allocate(conn, camp, owner_id + ":role:" + role, budget, kind="role", parent_id=owner_id, purpose=role)
-        if engineering["gpu_seconds"]:
-            _allocate(conn,camp,owner_id+":engineering_gpu",engineering,kind="engineering_gpu",parent_id=owner_id,purpose="engineering_multigpu")
-        for role,budget in preparation.items():
-            _allocate(conn,camp,owner_id+":prepare:"+role,budget,kind="role_preparation",parent_id=owner_id,purpose=role)
-        _allocate(conn, camp, owner_id + ":continuation", continuation, kind="continuation", parent_id=owner_id, purpose="research_planner")
+        owner = _allocate(conn, camp, owner_id, resources(), kind="selected_plan", binding={"plan_id": plan_id, "task_kind": task_kind, "recovery_limits": recovery_limits})
+        for role in roles:
+            _allocate(conn, camp, owner_id + ":role:" + role, resources(), kind="role", parent_id=owner_id, purpose=role)
+        if task_kind == "new_method":
+            _allocate(conn,camp,owner_id+":engineering_gpu",resources(),kind="engineering_gpu",parent_id=owner_id,purpose="engineering_multigpu")
+        for role in preparation:
+            if role not in roles:
+                raise OwnerBudgetError("role_preparation_allocation_invalid")
+            _allocate(conn,camp,owner_id+":prepare:"+role,resources(),kind="role_preparation",parent_id=owner_id,purpose=role)
+        _allocate(conn, camp, owner_id + ":continuation", resources(), kind="continuation", parent_id=owner_id, purpose="research_planner")
         return owner
 
 
@@ -694,8 +730,8 @@ def finish_selected_plan(camp, *, plan_id, observation_digest):
             for child in children:
                 if child.get("parent_id") in descendants and child["owner_id"] not in descendants:
                     descendants.add(child["owner_id"]);changed=True
-        pending = [claim for claim in _all(conn, "claims") if claim.get("owner_id") in descendants and claim["status"] in {"claimed", "inflight", "unknown"}]
-        if pending:
+        if _claims_require_reconciliation(camp, (
+                claim for claim in _all(conn, "claims") if claim.get("owner_id") in descendants)):
             raise OwnerBudgetError("owner_release_requires_reconciliation")
         # Move the unspent continuation into a top-level owner in one transaction.
         remaining = _remaining(continuation)
@@ -711,17 +747,10 @@ def finish_selected_plan(camp, *, plan_id, observation_digest):
 
 
 def allocate_research_continuation(camp, *, owner_id, observation_digest):
-    """Allocate a new Planner envelope from remaining global resources."""
+    """Bind the next planning round without reserving future requests."""
     camp = Path(camp)
-    config = ((_read(camp / "goal.json").get("research_execution") or {}).get("budget") or {})
-    planning = (config.get("envelopes") or {}).get("planning") or {}
-    from .research_execution import planning_call_budget
-    amount = _planning_resources(camp,
-        int(planning.get("input_tokens_per_call", config.get("input_tokens_per_call", 128000))),
-        int(planning.get("output_tokens_per_call", config.get("output_tokens_per_call", 32768))),
-        planning_call_budget(camp))
     with _transaction(camp) as conn:
-        owner = _allocate(conn, camp, owner_id, amount, kind="continuation",
+        owner = _allocate(conn, camp, owner_id, resources(), kind="continuation",
                           binding={"observation_digest": observation_digest})
         owner["observation_digest"] = observation_digest
         _put(conn, "owners", owner_id, owner)
@@ -753,14 +782,7 @@ def planner_owner(camp, *, observation_digest, round_id):
         else:
             if any(row["kind"] == "selected_plan" for row in _all(conn, "owners")):
                 raise OwnerBudgetError("continuation_observation_not_found")
-            config=((_read(camp/"goal.json").get("research_execution") or {}).get("budget") or {})
-            planning=(config.get("envelopes") or {}).get("planning") or {}
-            from .research_execution import planning_call_budget
-            amount = _planning_resources(camp,
-                int(planning.get("input_tokens_per_call", config.get("input_tokens_per_call", 128000))),
-                int(planning.get("output_tokens_per_call", config.get("output_tokens_per_call", 32768))),
-                planning_call_budget(camp))
-            owner = _allocate(conn, camp, "bootstrap:initial_planner", amount, kind="continuation", binding={"observation_digest": observation_digest})
+            owner = _allocate(conn, camp, "bootstrap:initial_planner", resources(), kind="continuation", binding={"observation_digest": observation_digest})
             if owner["status"] == "released":
                 raise OwnerBudgetError("bootstrap_round_already_finished")
             if owner.get("round_id") not in {None, round_id}:
@@ -803,12 +825,13 @@ def native_cost_floor(camp):
 
 
 def finish_planner_round(camp, owner_id):
-    """Unused correction allocation is released only after a completed round."""
+    """Close the completed planning owner while retaining its request charges."""
     with _transaction(Path(camp)) as conn:
         row = _get(conn, "owners", owner_id)
         if not row or row["kind"] != "continuation":
             raise OwnerBudgetError("planner_owner_not_continuation")
-        if any(claim.get("owner_id") == owner_id and claim["status"] in {"claimed", "inflight", "unknown"} for claim in _all(conn,"claims")):
+        if _claims_require_reconciliation(camp, (
+                claim for claim in _all(conn, "claims") if claim.get("owner_id") == owner_id)):
             raise OwnerBudgetError("continuation_release_requires_reconciliation")
         row["status"] = "released"
         _put(conn,"owners",owner_id,row)
@@ -822,7 +845,7 @@ def current_owner(camp):
         return _get(conn,"owners",scope[1])
 
 
-def reserve_phase_owner(camp, receipt_id, amount, replace_owner_id=None):
+def reserve_phase_owner(camp, receipt_id, amount=None, replace_owner_id=None):
     with _transaction(Path(camp)) as conn:
         owner_id = _role_owner_for_phase(conn,Path(camp))
         if replace_owner_id:
@@ -833,7 +856,7 @@ def reserve_phase_owner(camp, receipt_id, amount, replace_owner_id=None):
                 raise OwnerBudgetError("replacement_phase_requires_reconciliation")
             old["status"]="released"
             _put(conn,"owners",replace_owner_id,old)
-        return _allocate(conn,Path(camp),owner_id+":phase:"+receipt_id,amount,
+        return _allocate(conn,Path(camp),owner_id+":phase:"+receipt_id,resources(),
             kind="phase",parent_id=owner_id,purpose=receipt_id)
 
 
@@ -847,16 +870,16 @@ def _role_owner_for_phase(conn,camp):
     return owner_id
 
 
-def claim_training(camp, job_id, gpu_estimate, phase_owner_id=None):
+def claim_training(camp, job_id, phase_owner_id=None):
     camp = Path(camp)
     if not enabled(camp):
         return
     call_id = "job:"+job_id
-    amount=resources({"training_jobs":1,"gpu_seconds":gpu_estimate})
+    amount=resources({"training_jobs":1})
     with _transaction(camp) as conn:
         old=_get(conn,"claims",call_id)
         if old:
-            if old["requested"]!=amount:
+            if old["operation_id"] != job_id or old["role"] != "training":
                 raise OwnerBudgetError("training_claim_identity_conflict")
             return old
         _control(camp)
@@ -864,11 +887,11 @@ def claim_training(camp, job_id, gpu_estimate, phase_owner_id=None):
         row=_get(conn,"owners",owner_id)
         if not row or row["status"]!="active":
             raise OwnerBudgetError("training_owner_not_active")
-        _fit(amount,_available(conn,row),"training_owner_unavailable")
         claim={"call_id":call_id,"operation_id":job_id,"owner_id":owner_id,"role":"training",
             "requested":amount,"committed":amount,"actual":resources({"training_jobs":1}),"status":"inflight","created_at":time.time()}
         _adjust_consumed(conn,claim,amount)
         _put(conn,"claims",call_id,claim)
+        _check_global_equation(_snapshot(conn, camp))
         return claim
 
 
@@ -953,7 +976,6 @@ def mark_transport_dispatched(camp, call_id, *, provider="deepseek", model=None)
         if not claim or claim["status"]!="inflight" or claim.get("dispatched_at"):
             raise OwnerBudgetError("provider_transport_permit_already_used_or_missing")
         _verify_request_pricing(Path(camp), claim, provider=provider, model=model)
-        _check_global_equation(_snapshot(conn,Path(camp)))
         claim["dispatched_at"]=time.time()
         _put(conn,"claims",call_id,claim)
 
@@ -975,7 +997,7 @@ def mark_http_dispatched(camp, call_id, *, provider, model):
 
 
 def admission_available(camp, role):
-    """The caller's spendable balance, alongside protected global allocations."""
+    """The actual global balance attributed to the current role."""
     with _transaction(Path(camp)) as conn:
         owner_id=_role_owner(conn,Path(camp),role)
         snap=_snapshot(conn,Path(camp),owner_id)
@@ -984,21 +1006,24 @@ def admission_available(camp, role):
 
 
 def training_launch_admission(camp,job_id,n_gpu,*,now):
-    """No training entrypoint can consume another task's GPU allocation."""
+    """Dispatch once, with a deadline determined by the actual global balance."""
     if not enabled(camp):
         return None
     with _transaction(Path(camp)) as conn:
         _control(Path(camp))
-        _check_global_equation(_snapshot(conn,Path(camp)))
+        snap = _snapshot(conn, Path(camp))
+        _check_global_equation(snap)
         claim=_get(conn,"claims","job:"+job_id)
         if not claim or claim["role"]!="training" or claim["status"]!="inflight" or claim.get("process_dispatched_at"):
             raise OwnerBudgetError("training_launch_permit_already_used_or_missing")
-        if claim["committed"]["gpu_seconds"]<=0:
-            raise OwnerBudgetError("training_gpu_bound_required")
+        remaining = snap["global_remaining"]["gpu_seconds"]
+        if remaining is not None and remaining <= 0:
+            raise OwnerBudgetError("global_gpu_budget_exhausted")
         claim["process_dispatched_at"]=now
+        claim["n_gpu"] = max(1, n_gpu)
         _put(conn,"claims",claim["call_id"],claim)
-        return {"budget_owner":claim["owner_id"],"gpu_seconds_bound":claim["committed"]["gpu_seconds"],
-                "deadline_at":now+claim["committed"]["gpu_seconds"]/max(1,n_gpu)}
+        return {"budget_owner":claim["owner_id"],"gpu_seconds_bound":remaining,
+                "deadline_at":None if remaining is None else now+remaining/max(1,n_gpu)}
 
 
 
@@ -1009,18 +1034,20 @@ def claim_engineering_gpu(camp,probe_id,gpu_bound):
     with _transaction(camp) as conn:
         old=_get(conn,"claims","engineering:"+probe_id)
         if old:
-            if old["requested"]["gpu_seconds"]!=gpu_bound:
-                raise OwnerBudgetError("engineering_probe_bound_conflict")
             return old
         _control(camp)
         parent=_role_owner_for_phase(conn,camp)
         owner_id=parent+":engineering_gpu"
         owner=_get(conn,"owners",owner_id)
-        amount=resources({"gpu_seconds":gpu_bound})
         if not owner or owner["status"]!="active":
             raise OwnerBudgetError("engineering_gpu_owner_required")
-        _fit(amount,_available(conn,owner),"engineering_gpu_owner_unavailable")
-        _check_global_equation(_snapshot(conn,camp))
+        snap = _snapshot(conn, camp)
+        remaining = snap["global_remaining"]["gpu_seconds"]
+        if remaining is not None:
+            gpu_bound = min(gpu_bound, remaining)
+        if gpu_bound <= 0:
+            raise OwnerBudgetError("global_gpu_budget_exhausted")
+        amount=resources({"gpu_seconds":gpu_bound})
         claim={"call_id":"engineering:"+probe_id,"operation_id":probe_id,"owner_id":owner_id,"role":"engineering_probe",
             "requested":amount,"committed":amount,"actual":resources(),"status":"inflight","created_at":time.time()}
         _adjust_consumed(conn,claim,amount)

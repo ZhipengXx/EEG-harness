@@ -1,0 +1,4 @@
+# Optional paper search/reading, in the EEG agent's Python 3.12+ runtime.
+# Separate from the fMRI p2 extra: its legacy setuptools constraint conflicts
+# with GPT Researcher's dependencies when all project extras are locked together.
+gpt-researcher @ git+https://github.com/assafelovic/gpt-researcher.git@3582a6841fe7dc801e2a34e34ee408641aea9bce

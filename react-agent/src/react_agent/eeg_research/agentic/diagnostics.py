@@ -33,6 +33,7 @@ def _training_execution_summary(item: Any) -> dict[str, Any]:
             "loss_definition", "loss_direction_reduction", "loss_replica_reduction",
             "negative_sampling_policy", "objective_is_custom", "optimizer_learning_rates",
             "embedding_dtype", "epoch_reduction", "coverage", "limitations",
+            "objective_samples", "resolved_model_configuration",
         ) if key in payload}
         if isinstance(payload.get("batches"), list):
             batches = []
@@ -46,7 +47,9 @@ def _training_execution_summary(item: Any) -> dict[str, Any]:
                 replicas = batch.get("replicas")
                 if isinstance(replicas, list):
                     observed["local_batch_sizes"] = [replica.get("local_batch_size") for replica in replicas]
-                    observed["logit_scales"] = [replica.get("logit_scale") for replica in replicas]
+                    arguments = [replica["scale_argument"] for replica in replicas if "scale_argument" in replica]
+                    if arguments:
+                        observed["scale_arguments"] = arguments
                 batches.append(observed)
             kept["batches"] = batches
         projected["payload"] = kept
@@ -85,6 +88,7 @@ def summarize_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
                 "gallery_size",
                 "execution_status",
                 "mismatches",
+                "top1", "top5", "rank_interval_mean", "hubness",
             ):
                 if key in payload:
                     summary["items"][name][key] = payload[key]

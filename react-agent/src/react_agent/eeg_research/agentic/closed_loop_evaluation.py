@@ -141,7 +141,8 @@ def _terminal_delivery_proof(camp: Path, trace: dict, record: dict) -> dict:
         return value
     delivered = expand(payload)
     # The v2 Planner input renders each card's science body as one flat row.
-    rows = delivered.get("observations") or []
+    from .planning_context import expanded_observations
+    rows = expanded_observations(delivered)
     chosen = [row for row in rows if row.get("observation_id") == record["record_id"] and row.get("current_feedback") is True]
     if len(chosen) != 1:
         return {"verified": False, "reason": "current_terminal_card_missing_or_nonunique"}

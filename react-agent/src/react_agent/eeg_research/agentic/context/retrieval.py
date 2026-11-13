@@ -13,69 +13,84 @@ from typing import Any
 VERSION = "eeg_research.context.retrieval.v1"
 MAX_DELIVERY_CHARS = 8000
 MAX_CANDIDATES = 128
-MAX_QUERY_CHARS = 1800
 MAX_CHUNKS = 32
 
 
-def _text(value: Any, limit: int = 320) -> str:
-    if isinstance(value, str):
-        return value.strip()[:limit]
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return str(value)
-    return ""
-
-
 def prepare_query(*, question: Any = "", action: Any = "", error: Any = "",
-                  method: Any = "", protocol: Any = "", identities: Any = (),
+                  method: Any = "", protocol: Any = "", identities: Any = (), feedback: Any = "",
                   tokenizer=None, max_tokens: int | None = None,
-                  max_chars: int = MAX_QUERY_CHARS) -> dict:
-    """Use the current question and a few selected fields, never an observation.
+                  max_chars: int | None = None) -> dict:
+    """Build one encoding view from original fields, with truthful coverage.
 
-    Structured method/protocol dictionaries have an explicit small keyword
-    projection.  Caller-supplied strings are treated as excerpts, with the
-    omission recorded, rather than claiming their full meaning was encoded.
+    The tokenizer owns the production query limit. Callers can request a
+    character excerpt explicitly, but intermediate callers never shorten and
+    rewrap a query before this boundary.
     """
-    def keywords(value):
+    def words(value):
         if isinstance(value, dict):
-            return " ".join(filter(None, (_text(value.get(k), 100) for k in
-                ("method", "method_revision", "intervention", "scope", "regime",
-                 "dataset", "evaluation_identity", "error_type", "code"))))[:400]
-        return _text(value, 400)
+            return " ".join(str(value[key]).strip() for key in (
+                "method", "method_revision", "intervention", "scope", "regime",
+                "dataset", "evaluation_identity", "error_type", "code")
+                if value.get(key) not in (None, ""))
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return str(value)
+        return value.strip() if isinstance(value, str) else ""
 
-    fields = [("Question", _text(question, 600)), ("Action", _text(action, 120)),
-              ("Error", keywords(error)), ("Method", keywords(method)),
-              ("Protocol", keywords(protocol))]
-    ids = []
+    fields = [("Feedback", words(feedback)), ("Question", words(question)),
+              ("Action", words(action)), ("Error", words(error)), ("Method", words(method)),
+              ("Protocol", words(protocol))]
     if isinstance(identities, (list, tuple)):
-        ids = [_text(v, 80) for v in identities[:4] if _text(v, 80)]
-    fields.append(("IDs", " ".join(ids)))
-    active = [(k, v) for k, v in fields if v]
-    complete = active[0][1] if len(active) == 1 and active[0][0] == "Question" else "\n".join(f"{k}: {v}" for k, v in active)
-    text = complete[:max(0, min(max_chars, MAX_QUERY_CHARS))]
-    original_hash = hashlib.sha256(complete.encode()).hexdigest()
-    input_fields = (("question", question, 600), ("action", action, 120),
-                    ("error", error, 400), ("method", method, 400), ("protocol", protocol, 400))
-    selected_fields = {name: {"original_chars": len(value), "selected_char_range": [0, min(len(value.strip()), limit)],
-                             "complete": len(value.strip()) <= limit}
-                       for name, value, limit in input_fields if isinstance(value, str) and value}
-    metadata = {"builder_version": VERSION, "query_hash": original_hash,
-                "representation": "bounded_query_card", "omitted": text != complete or any(
-                    not field["complete"] for field in selected_fields.values()), "selected_fields": selected_fields,
-                "chars": len(text)}
+        fields.append(("IDs", " ".join(str(value).strip() for value in identities if value not in (None, ""))))
+    active = [(key, value) for key, value in fields if value]
+    selected = dict(active)
+    bare_question = len(active) == 1 and active[0][0] == "Question"
+
+    def render():
+        return "\n".join(("" if bare_question else label + ": ") + selected[label]
+                         for label, _ in active if selected[label])
+
+    def shorten(label, target, current):
+        value = selected[label]
+        end = max(0, min(len(value) - 1, len(value) * max(0, target) // current))
+        boundary = value.rfind(" ", 0, end + 1)
+        selected[label] = value[:boundary if boundary > end // 2 else end].rstrip()
+
+    def fit(limit, size, field_size):
+        # Reduce the longest fields together. A long question therefore does
+        # not crowd out a short method/feedback field; spare capacity is shared.
+        text = render()
+        while size(text) > limit and any(selected.values()):
+            counts = {label: field_size(value) for label, value in selected.items() if value}
+            longest = max(counts.values())
+            group = [label for label, count in counts.items() if count == longest]
+            next_length = max((count for count in counts.values() if count < longest), default=0)
+            excess = size(text) - limit
+            reduction = min(longest - next_length, max(1, (excess + len(group) - 1) // len(group)))
+            for label in group:
+                shorten(label, longest - reduction, longest)
+            text = render()
+        return text
+
+    complete = render()
+    metadata = {"builder_version": VERSION, "query_hash": hashlib.sha256(complete.encode()).hexdigest(),
+                "representation": "bounded_query_card"}
+    text = complete
+    if max_chars is not None:
+        text = fit(max(0, max_chars), len, len)
     if tokenizer is not None:
         if max_tokens is None or max_tokens < 4:
             raise ValueError("query_token_budget_missing")
-        ids = tokenizer(text, truncation=False, add_special_tokens=True)["input_ids"]
-        metadata["original_token_count"] = len(ids)
-        # Deterministic prefix excerpt; metadata explicitly says what it covers.
-        while len(ids) > max_tokens and text:
-            text = text[:max(0, len(text) * max_tokens // len(ids) - 1)]
-            ids = tokenizer(text, truncation=False, add_special_tokens=True)["input_ids"]
-        metadata.update(encoded_token_count=len(ids), max_sequence_length=max_tokens,
-                        omitted=metadata["omitted"] or len(ids) < metadata["original_token_count"],
-                        selected_char_range=[0, len(text)], chars=len(text))
-        if len(ids) > max_tokens:
+        count = lambda value: len(tokenizer(value, truncation=False, add_special_tokens=True)["input_ids"])
+        content_count = lambda value: max(1, len(tokenizer(value, truncation=False, add_special_tokens=False)["input_ids"]))
+        text = fit(max_tokens, count, content_count)
+        metadata.update(original_token_count=count(complete), encoded_token_count=count(text),
+                        max_sequence_length=max_tokens)
+        if count(text) > max_tokens:
             raise ValueError("query_special_tokens_exceed_budget")
+    metadata.update(omitted=text != complete, chars=len(text), selected_fields={
+        label.lower(): {"original_chars": len(value), "selected_char_range": [0, len(selected[label])],
+                        "complete": selected[label] == value}
+        for label, value in active})
     return {"text": text, "metadata": metadata}
 
 

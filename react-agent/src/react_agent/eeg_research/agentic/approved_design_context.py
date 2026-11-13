@@ -11,6 +11,28 @@ from typing import Any
 from .context.types import canonical
 
 
+def current_implementation_audit_issues(spec: dict, *, candidate_id: str | None = None) -> list[dict]:
+    """Select explicitly bound implementation findings, not research audit history."""
+    experiment = spec.get("experiment") if isinstance(spec.get("experiment"), dict) else spec
+    requirements = experiment.get("implementation_requirements")
+    if requirements is None:
+        requirements = (experiment.get("design_brief") or {}).get("implementation_requirements") or []
+    requirement_ids = {row.get("requirement_id") for row in requirements if isinstance(row, dict)} - {None}
+    categories = {"implementation", "engineering", "code_error", "design_conflict", "framework_issue"}
+    selected = []
+    for issue in spec.get("audit_issues") or []:
+        if not isinstance(issue, dict) or issue.get("status") in {"resolved", "closed", "superseded_by_current_checks"}:
+            continue
+        target = issue.get("candidate_id")
+        if target is not None and target != candidate_id:
+            continue
+        linked = {issue.get("requirement_id"), *(issue.get("requirement_ids") or [])} - {None}
+        if (linked & requirement_ids or candidate_id is not None and target == candidate_id
+                and issue.get("kind", issue.get("category")) in categories):
+            selected.append(copy.deepcopy(issue))
+    return selected
+
+
 def project_approved_design(spec: dict[str, Any], *, selected_task: dict | None = None,
                             interface: dict | None = None,
                             effective_hook_config: dict | None = None) -> dict[str, Any]:
@@ -75,6 +97,8 @@ def project_approved_design(spec: dict[str, Any], *, selected_task: dict | None 
             raise ValueError("approved_design_effective_hook_config_not_object:" + name)
         hooks[name] = {"mode": mode, "effective_config": copy.deepcopy(configuration)}
     result["hooks"] = hooks
+    if "training" in experiment:
+        result["training"] = copy.deepcopy(experiment["training"])
 
     declarations = experiment.get("implementation_requirements")
     if declarations is None:

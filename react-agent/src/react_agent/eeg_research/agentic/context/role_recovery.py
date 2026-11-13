@@ -57,6 +57,7 @@ def _pending_designer_correction(camp: Path, call: dict, response: dict,
     if len(ids) >= limit:
         raise _error("reviewer_correction_attempts_exhausted" if role == "candidate_reviewer"
                      else "analysis_correction_attempts_exhausted" if role == "result_analyst"
+                     else "literature_correction_attempts_exhausted" if role.startswith("literature_")
                      else "designer_correction_attempts_exhausted")
     sidecars = copy.deepcopy(call.get("context_sidecars") or {})
     if call.get("designer_assembly_ref"):
@@ -151,7 +152,8 @@ def recover_role_reply(camp: Path, *, role: str, resolved: Any,
                        request_semantics_digest: str | None = None,
                        allow_designer_correction: bool = False,
                        allow_reviewer_correction: bool = False,
-                       allow_analysis_correction: bool = False) -> dict | PendingRoleCorrection | None:
+                       allow_analysis_correction: bool = False,
+                       allow_literature_correction: bool = False) -> dict | PendingRoleCorrection | None:
     """Return a validated original reply, or block a paid-but-unproven reply.
 
     Nothing is returned for a request that has never reached transport. Known
@@ -256,13 +258,26 @@ def recover_role_reply(camp: Path, *, role: str, resolved: Any,
             raise _error("role_recovery_transport_config_mismatch")
         if digest({"system": traced["system"], "user": traced["user"], "transport_fields": fields}) != call.get("context_request_digest"):
             raise _error("role_recovery_prepared_digest_mismatch")
+        revalidate_empty_coder_map = False
         if role == "candidate_coder" and response.get("validation") == "coder_tool_request_invalid":
             reply = response.get("reply")
             if not isinstance(reply, dict) or digest(reply) != call.get("response_reply_sha256"):
                 raise _error("role_recovery_response_hash_missing_or_changed")
-            # Known invalid tool arguments executed nothing. Preserve their spend
-            # and let the existing operation allowance govern the next attempt.
-            return None
+            from ..coder_contract import empty_implementation_map_is_local
+            # An explicitly empty roster now owns this field locally. Recover
+            # only that old rejection, through all normal paid/source proofs
+            # below; other invalid arguments keep their existing retry budget.
+            errors = response.get("schema_errors")
+            revalidate_empty_coder_map = (
+                isinstance(errors, dict)
+                and errors.get("error") == "implementation_map_unknown_requirement"
+                and reply.get("tool") == "finish_patch"
+                and isinstance(reply.get("args"), dict)
+                and "implementation_map" in reply["args"]
+                and empty_implementation_map_is_local(frozen_user)
+            )
+            if not revalidate_empty_coder_map:
+                return None
         revalidate_review_schema = (role == "candidate_reviewer"
                                     and response.get("validation") == "domain_schema_invalid")
         revalidate_designer = (allow_designer_correction and designer_scientific_wire
@@ -274,9 +289,12 @@ def recover_role_reply(camp: Path, *, role: str, resolved: Any,
                               and response.get("validation") in {"pending", "valid", "reviewer_output_invalid"})
         revalidate_analysis = (allow_analysis_correction and analyst_scientific_wire
                                and response.get("validation") in {"pending", "valid", "domain_schema_invalid", "analysis_reply_invalid"})
+        from ..literature_contract import LITERATURE_ROLES
+        revalidate_literature = (allow_literature_correction and role in LITERATURE_ROLES
+                                and response.get("validation") in {"pending", "valid", "domain_schema_invalid"})
         if (response.get("validation") not in {"pending", "valid"}
                 and not revalidate_review_schema and not revalidate_designer and not revalidate_reviewer
-                and not revalidate_analysis
+                and not revalidate_analysis and not revalidate_literature and not revalidate_empty_coder_map
                 or not isinstance(response.get("reply"), dict)):
             raise _error("role_recovery_reply_invalid")
         reply = response["reply"]
@@ -334,6 +352,10 @@ def recover_role_reply(camp: Path, *, role: str, resolved: Any,
                     # Resume the full original native binding, never a current
                     # caller's reconstructed or newly retrieved input.
                     return _pending_designer_correction(camp, call, response, traced, analyst_native, calls)
+            if revalidate_literature:
+                from pydantic import ValidationError
+                if isinstance(exc, ValidationError):
+                    return _pending_designer_correction(camp, call, response, traced, frozen_user, calls)
             raise
         if not isinstance(result, dict):
             raise _error("role_recovery_domain_validator_invalid")
@@ -356,6 +378,13 @@ def recover_role_reply(camp: Path, *, role: str, resolved: Any,
     if revalidate_designer and response.get("validation") not in {"pending", "valid"}:
         receipt["original_validation"] = response["validation"]
         receipt["revalidated_by"] = "current_designer_contract_and_frozen_input"
+    if revalidate_empty_coder_map:
+        receipt["original_validation"] = response["validation"]
+    if role == "candidate_coder":
+        from ..coder_contract import coder_request_normalization
+        normalization = coder_request_normalization(reply, result["tool"], result["args"])
+        if normalization:
+            receipt["normalization"] = normalization
     existing = _rows(camp / "role_response_recovery.jsonl")
     if not any(row.get("call_id") == call_id and row.get("task_id") == receipt["task_id"] for row in existing):
         with (camp / "role_response_recovery.jsonl").open("a", encoding="utf-8") as stream:

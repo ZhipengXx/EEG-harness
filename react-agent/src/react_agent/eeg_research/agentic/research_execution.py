@@ -46,8 +46,9 @@ def role_api_attempt_limit(value: Mapping | Path | str, role: str, default: int 
               "research_critic": "max_critic_api_attempts",
               "experiment_designer": "max_designer_api_attempts"}
     field = fields.get(role)
-    implicit = SCIENCE_MAX_ATTEMPTS if field and single_plan_enabled(goal) else default
-    limit = config.get(field, implicit) if field else default
+    from .literature_contract import LITERATURE_ROLES
+    implicit = SCIENCE_MAX_ATTEMPTS if role in LITERATURE_ROLES or field and single_plan_enabled(goal) else default
+    limit = config.get(field, implicit) if field else implicit
     if type(limit) is not int or not 1 <= limit <= SCIENCE_MAX_ATTEMPTS:
         raise ValueError("invalid_role_api_attempt_limit:" + role)
     policy = goal.get("api_request_policy") or {}

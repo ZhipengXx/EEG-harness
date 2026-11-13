@@ -111,19 +111,26 @@ def _project(record: dict, receipts: list[dict], original_hash: str) -> dict:
     return record
 
 
-def read_projected_decision(camp: Path, decision_id: str) -> dict:
+def receipt_groups(camp: Path) -> dict[str, list[dict]]:
+    """Read and validate one ledger snapshot for a read-only recovery pass."""
+    grouped: dict[str, list[dict]] = {}
+    for row in _rows(camp / LEDGER):
+        grouped.setdefault(row["decision_id"], []).append(row)
+    return grouped
+
+
+def read_projected_decision(camp: Path, decision_id: str, *,
+                            receipts_by_decision: dict[str, list[dict]] | None = None) -> dict:
     body, original_hash = _original(camp, decision_id)
-    rows = [row for row in _rows(camp / LEDGER) if row["decision_id"] == decision_id]
+    grouped = receipt_groups(camp) if receipts_by_decision is None else receipts_by_decision
+    rows = grouped.get(decision_id, [])
     body["decision"] = _project(body["decision"], rows, original_hash)
     return body
 
 
 def project_decisions(camp: Path, state: dict) -> None:
     """Overlay receipts on the mutable campaign projection, never its sources."""
-    rows = _rows(camp / LEDGER)
-    grouped: dict[str, list[dict]] = {}
-    for row in rows:
-        grouped.setdefault(row["decision_id"], []).append(row)
+    grouped = receipt_groups(camp)
     for record in state.get("decisions") or []:
         decision_id = str(record.get("decision_id"))
         if decision_id not in grouped:

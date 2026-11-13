@@ -33,7 +33,7 @@ def persist_approved_binding(
     attempt_id: str | None = None,
     source_hash: str | None = None,
 ) -> dict[str, Any]:
-    """Write the approved hook binding for one candidate. Baseline is never overwritten by this."""
+    """Write one candidate's approved method binding without changing baseline."""
     target = str(target_id or "")
     if not target or target == BASELINE_TARGET:
         return dict(BASELINE_HOOK_SPEC)
@@ -58,6 +58,8 @@ def persist_approved_binding(
         "hypothesis": spec.get("hypothesis"),
         "implementation_requirements": spec.get("implementation_requirements") or [],
     }
+    if isinstance(spec.get("training"), dict):
+        binding["training"] = dict(spec["training"])
     if spec.get("design_contract_version") == "v2":
         binding["design_contract_version"] = "v2"
         binding["scientific_parameters"] = spec.get("scientific_parameters") or {}
@@ -94,8 +96,33 @@ def load_approved_binding(camp: Path, target_id: str) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def resolve_execution_protocol(
+    camp: Path,
+    target_id: str | None,
+    protocol: dict[str, Any],
+    *,
+    binding: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Use this target's approved training recipe for dispatch and probes.
+
+    Baseline remains the research reference. Supplying an already loaded
+    binding lets run preparation reuse it without a second disk read.
+    """
+    target = str(target_id or BASELINE_TARGET)
+    if target == BASELINE_TARGET:
+        return protocol
+    binding = binding if binding is not None else load_approved_binding(camp, target)
+    if binding is None:
+        raise ExperimentResolutionError("missing_binding")
+    training = binding.get("training")
+    if not isinstance(training, dict):
+        return protocol
+    from .execution_protocol import with_training_recipe
+    return with_training_recipe(protocol, training)
+
+
 def _hook_spec_from(payload: dict[str, Any]) -> dict[str, Any]:
-    return {
+    hook = {
         "model": payload.get("model") if isinstance(payload.get("model"), dict) else {},
         "objective": payload.get("objective") if isinstance(payload.get("objective"), dict) else {},
         "transform": payload.get("transform") if isinstance(payload.get("transform"), dict) else {},
@@ -103,17 +130,21 @@ def _hook_spec_from(payload: dict[str, Any]) -> dict[str, Any]:
         "spec_hash": payload.get("spec_hash"),
         "spec_ref": payload.get("spec_ref"),
     }
+    if isinstance(payload.get("training"), dict):
+        hook["training"] = dict(payload["training"])
+    return hook
 
 
 def intervention_config_hash(hook: dict[str, Any]) -> str:
-    return _digest(
-        {
+    body = {
             "model": hook.get("model") or {},
             "objective": hook.get("objective") or {},
             "transform": hook.get("transform") or {},
             "negative_sampling_policy": hook.get("negative_sampling_policy"),
         }
-    )
+    if "training" in hook:
+        body["training"] = hook["training"]
+    return _digest(body)
 
 
 def run_config_hash(hook: dict[str, Any], *, seed: int | None, fidelity: str | None, extra: dict[str, Any] | None = None) -> str:
@@ -125,6 +156,8 @@ def run_config_hash(hook: dict[str, Any], *, seed: int | None, fidelity: str | N
         "seed": seed,
         "fidelity": fidelity,
     }
+    if "training" in hook:
+        body["training"] = hook["training"]
     if extra:
         body.update(extra)
     return _digest(body)
@@ -161,6 +194,10 @@ def build_frozen_run_spec(
             raise ExperimentResolutionError("missing_binding")
         source_hash = binding.get("source_hash")
         control = binding.get("control_candidate_id") or "baseline"
+    from .execution_protocol import training_recipe
+    if "training" not in hook and all(key in protocol for key in ("full_epochs", "lr", "batch_size")):
+        hook["training"] = training_recipe(protocol)
+    protocol = resolve_execution_protocol(camp, target, protocol, binding=binding)
     frozen = {
         "schema_version": FROZEN_SCHEMA,
         "target_id": target,
@@ -188,6 +225,8 @@ def build_frozen_run_spec(
         "approved_binding": binding,
         "spec_ref": spec_ref,
     }
+    if "training" in hook:
+        frozen["training"] = dict(hook["training"])
     if protocol.get("evaluation_mode") == "loso_method_search":
         frozen["recipe"].update({key: protocol.get(key) for key in (
             "evaluation_mode", "checkpoint_policy", "selection_min_delta", "full_epochs", "fidelity_overrides",

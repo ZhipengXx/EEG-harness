@@ -36,7 +36,7 @@ CONTROL_FIELDS = frozenset({
     "evaluation_mode", "evaluation_schedule", "scientific_unit", "science_scope", "screening_evidence_scope",
     "full_required_fold_count", "declared_full_primary_metric", "primary_metric", "state", "authoritative_state",
     "task", "intent", "permissions", "resources", "frontier", "active_tasks", "pending_tasks", "current_feedback",
-    "selected_research_task", "origin_plan_id", "selected_plan",
+    "selected_research_task", "current_experiment_setting", "origin_plan_id", "selected_plan",
     "candidate_admissions_projection", "inherited_candidate_admissions_projection", "action_cost_estimates_projection",
 })
 FACT_FIELDS = frozenset({"evidence", "method_screenings", "method_suites", "method_suite", "run", "metrics",
@@ -54,6 +54,8 @@ MISSIONS = {
     "memory_curator": "Extract conditional source-grounded experience; do not create new measured facts or approval.",
     "result_auditor": "Audit claims against their actual sources, scopes, coverage and read status.",
     "research_librarian": "Return bounded source-grounded retrieval relevant to the current question.",
+    "literature_query_planner": "Form academic search queries for the supplied scientific question and setting.",
+    "literature_reader": "Extract the supplied paper's reported findings and experimental setting.",
     "context_summary": "Write bounded source-grounded interpretation patches, preserving failures and unresolved questions.",
     "memory_extraction": "Extract a closed operation episode or no_signal with explicit provenance.",
     "memory_consolidation": "Merge conditional lessons and skills using current support and counterexamples.",
@@ -73,6 +75,8 @@ ROLE_REQUIRED = {
     "memory_curator": frozenset({"source_cards", "closed_groups", "closed_sections", "fact_card", "episode", "run", "evidence", "method_suite"}),
     "result_auditor": frozenset({"evidence", "report", "report_draft", "method_suite", "method_suites", "method_screenings", "metrics", "comparison", "checks", "audit_feedback"}),
     "research_librarian": frozenset({"query", "current_question", "retrieved_memory", "retrieved_context", "search_results"}),
+    "literature_query_planner": frozenset({"research_question", "task_setting", "evaluation_protocol"}),
+    "literature_reader": frozenset({"research_question", "task_setting", "evaluation_protocol", "paper"}),
     "context_summary": frozenset({"closed_sections", "source_cards", "previous_snapshot", "facts"}),
     "memory_extraction": frozenset({"closed_sections", "source_cards", "fact_card", "operation"}),
     "memory_consolidation": frozenset({"new_episodes", "changes", "related_memories", "source_cards"}),
@@ -91,10 +95,10 @@ def role_policy(role: str, *, execution_version: str | None = None, planning_mod
         required = (required - HISTORY_FIELDS) | frozenset({"experiment_observations", "history_navigation", "context_delivery_version"})
     mission = MISSIONS[role]
     if role == "experiment_designer":
-        required = frozenset({"goal", "selected_research_task", "selection_basis", "candidate_interface",
-            "parent_source", "control_source", "parent_hook_config", "confirmation_policy",
+        required = frozenset({"goal", "selected_research_task", "current_experiment_setting", "candidate_interface",
+            "parent_source", "parent_hook_config",
             "evaluation_contract", "unavailable_context"})
-        mission = "Design the selected method using supplied scientific constraints, actual source and applicable evidence."
+        mission = "Implement the selected method as an executable design using its fixed task, parent source and interface."
     if execution_version == "single_plan_v1" and role == "research_planner":
         mission = "Compare 2–4 bounded research tasks against current observation cards, costs and permissions; select one task to feedback."
         if planning_mode == "propose_then_critic":

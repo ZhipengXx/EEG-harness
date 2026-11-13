@@ -17,7 +17,7 @@ def authorize_low_memory_sharing(camp: Path, state: dict, *, max_memory_mib: int
     from react_agent.eeg_research.agentic.loso_study import gpu_inventory
     if (state.get("evaluation_mode") != "loso_method_search" or state.get("live_job")
             or state.get("active_suite") or not state.get("execution_fingerprint")
-            or not isinstance(state.get("gpu"), list) or len(state["gpu"]) < 2
+            or not isinstance(state.get("gpu"), list) or not state["gpu"]
             or any(type(card) is not int for card in state["gpu"])
             or len(set(state["gpu"])) != len(state["gpu"])
             or type(max_memory_mib) is not int or max_memory_mib < 1 or not reason.strip()):

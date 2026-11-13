@@ -125,12 +125,82 @@ def freeze_planning_contract(full: dict) -> dict:
             if problem not in errors:
                 errors.append(problem)
             continue
-        identity = {"task_kind": kind, "target_candidate_ref": target, "evaluation_scope": scope}
-        tasks.append({"task_ref": "task_" + digest(identity)[:16], **identity,
-                      "completion_condition": _COMPLETION[kind]})
+        scopes = [scope]
+        if phase == "diagnostic":
+            from .suite_diagnostics import diagnostic_profiles
+            scopes = [{**scope, "diagnostic_request": request}
+                      for request in diagnostic_profiles(full, target)]
+        for task_scope in scopes:
+            identity = {"task_kind": kind, "target_candidate_ref": target, "evaluation_scope": task_scope}
+            tasks.append({"task_ref": "task_" + digest(identity)[:16], **identity,
+                          "completion_condition": _COMPLETION[kind]})
     if not tasks and not errors:
         errors.append(_error("planning_no_native_tasks", ["tasks"], "No task is eligible under the frozen native state."))
-    return {"version": VERSION, "tasks": tasks, "native_errors": errors}
+    parents = [{"parent_ref": "baseline"}]
+    detached = full.get("detached_candidates") or {}
+    reusable = {row["candidate_id"] for row in full.get("candidates") or []
+                if row.get("candidate_id") and row.get("status") == "ready"}
+    if full.get("candidate_ready") and full.get("candidate_id"):
+        reusable.add(full["candidate_id"])
+    parents.extend({"parent_ref": candidate} for candidate in sorted(reusable)
+                   if candidate != "baseline" and candidate not in detached)
+    return {"version": VERSION, "tasks": tasks,
+            "parent_methods": parents if any(row["task_kind"] == "new_method" for row in tasks) else [],
+            "native_errors": errors}
+
+
+def parent_catalog(full: dict) -> list[dict]:
+    """Frozen reusable identities; no historical evidence or source rereads."""
+    contract = full.get("_planning_contract")
+    if isinstance(contract, dict):
+        return copy.deepcopy(contract.get("parent_methods") or [])
+    return copy.deepcopy(full.get("available_parent_methods") or [])
+
+
+def parent_method_summaries(full: dict, baseline: dict, observations=()) -> list[dict]:
+    """Describe approved parents using shared baseline values plus literal changes.
+
+    Hook overrides replace complete config groups; training overrides replace
+    individual settings in the reference recipe.
+    """
+    sources = full.get("parent_method_configs") or {}
+    recipe = baseline.get("recipe") or {}
+    result = []
+    for parent in parent_catalog(full):
+        target = parent["parent_ref"]
+        row = {"parent_ref": target}
+        config = sources.get(target)
+        if target != "baseline" and isinstance(config, dict):
+            if config.get("intervention"):
+                row["intervention"] = config["intervention"]
+            row["hook_config_ref"] = "baseline_method"
+            changes = {key: copy.deepcopy(config[key]) for key in ("model", "objective", "transform")
+                       if key in config and config[key] != baseline.get(key, {})}
+            if changes:
+                row["hook_config_overrides"] = changes
+            training = config.get("training") or {}
+            if recipe:
+                row["training_ref"] = "protocol.training_recipe"
+                configured = {"full_epochs" if key == "epochs" else key: value
+                              for key, value in training.items()}
+                changes = {key: copy.deepcopy(value) for key, value in configured.items()
+                           if key not in recipe or value != recipe[key]}
+                if changes:
+                    row["training_overrides"] = changes
+            elif training:
+                row["training"] = copy.deepcopy(training)
+            policy = config.get("negative_sampling_policy")
+            if policy is not None:
+                row["negative_sampling_policy"] = policy
+            if config.get("scientific_parameters"):
+                row["scientific_parameters"] = copy.deepcopy(config["scientific_parameters"])
+        ids = list(dict.fromkeys(obs["observation_id"] for obs in observations
+            if obs.get("observation_id") and
+            (obs.get("identity") or {}).get("candidate_id", obs.get("candidate_id")) == target))
+        if ids:
+            row["observation_ids"] = ids
+        result.append(row)
+    return result
 
 
 def task_catalog(full: dict) -> list[dict]:
@@ -153,6 +223,14 @@ def planner_wire_schema(full: dict | None = None, *, correction: bool = False, r
     item = model.model_json_schema()
     if len(tasks) > 1:
         item["properties"]["task_ref"]["enum"] = [row["task_ref"] for row in tasks]
+    parents = [row["parent_ref"] for row in parent_catalog(full)]
+    if parents:
+        parent_schema = {"type": "string", "enum": parents}
+        item["properties"]["parent_ref"] = (parent_schema if tasks and all(
+            row["task_kind"] == "new_method" for row in tasks) else
+            {"anyOf": [parent_schema, {"type": "null"}]})
+    elif tasks and all(row["task_kind"] != "new_method" for row in tasks):
+        item["properties"]["parent_ref"] = {"type": "null"}
     return {"title": "PlannerCorrectionWire" if correction else "PlannerGenerationWire", "type": "object",
             "additionalProperties": False, "required": ["proposals"], "properties": {"proposals": {
                 "type": "array", "minItems": 1 if correction else 2, "maxItems": min(4, max(0, remaining)),
@@ -168,9 +246,11 @@ def _validation_errors(exc: ValidationError, prefix=()) -> list[dict]:
 def scientific_proposal_view(native: dict, full: dict) -> dict:
     """The provider never needs locally duplicated intent/value or protocol fields."""
     result = {"question": native["question"], "method": native["task_description"],
+              "parent_ref": native.get("parent_ref"),
               "rationale": native["scientific_intent"], "expected_observation": native["expected_observation"],
               "implementation_risk": native.get("implementation_risk"),
               "basis_observation_ids": copy.deepcopy(native.get("basis_observation_ids") or []),
+              "comparison_observation_ids": copy.deepcopy(native.get("comparison_observation_ids") or []),
               "required_context_refs": copy.deepcopy(native.get("required_context_refs") or [])}
     tasks = task_catalog(full)
     if len(tasks) > 1:
@@ -228,8 +308,18 @@ def materialize_planner_reply(raw: Any, full: dict, *, stage: str = "generation"
             result["errors"].append(_error("planning_task_ref_unknown", ["proposals", index, "task_ref"],
                                          "Select one supplied task_ref."))
             continue
+        parent = wire["parent_ref"]
+        parents = {row["parent_ref"] for row in parent_catalog(full)}
+        if selected["task_kind"] == "new_method" and parent not in parents:
+            result["errors"].append(_error("planning_parent_ref_unknown", ["proposals", index, "parent_ref"],
+                "Select one parent_ref from available_parent_methods for this new method."))
+            continue
+        if selected["task_kind"] != "new_method" and parent is not None:
+            result["errors"].append(_error("planning_parent_ref_not_applicable", ["proposals", index, "parent_ref"],
+                "Use null when measuring or diagnosing an existing method."))
+            continue
         invalid = False
-        for field in ("basis_observation_ids", "required_context_refs"):
+        for field in ("basis_observation_ids", "comparison_observation_ids", "required_context_refs"):
             if len(set(wire[field])) != len(wire[field]):
                 invalid = True
                 result["errors"].append(_error("planning_reference_duplicate", ["proposals", index, field],
@@ -239,6 +329,7 @@ def materialize_planner_reply(raw: Any, full: dict, *, stage: str = "generation"
         tag = ("c" if stage == "correction" else "c" + stage.removeprefix("correction_") + "p") if correction else "g"
         pid = "proposal_" + round_id(full).removeprefix("research_round_") + "_" + tag + str(index + 1)
         result["proposals"].append({"proposal_id": pid, "task_kind": selected["task_kind"],
+            "parent_ref": parent,
             "target_candidate_ref": selected.get("target_candidate_ref"), "question": wire["question"],
             "task_description": wire["method"], "scientific_intent": wire["rationale"],
             "evaluation_scope": copy.deepcopy(selected["evaluation_scope"]),
@@ -246,6 +337,7 @@ def materialize_planner_reply(raw: Any, full: dict, *, stage: str = "generation"
             "completion_condition": selected["completion_condition"], "cost_assessment": {},
             "implementation_risk": wire["implementation_risk"], "value_rationale": wire["rationale"],
             "basis_observation_ids": copy.deepcopy(wire["basis_observation_ids"]),
+            "comparison_observation_ids": copy.deepcopy(wire["comparison_observation_ids"]),
             "required_context_refs": copy.deepcopy(wire["required_context_refs"])})
     return result
 

@@ -93,17 +93,12 @@ def proposal_cost(proposal: dict, observation: dict) -> dict:
         result["predicted"]["implementation_risk"] = {"assessment": proposal["implementation_risk"],
             "authority": "model_prediction_not_execution_authority"}
     if phase == "diagnostic":
+        request = (proposal.get("evaluation_scope") or {}).get("diagnostic_request") or {}
         result.update(known={"training_jobs": 0, "gpu_seconds": 0.0, "feedback_report_count": 1},
-                      basis=["Diagnostic task reuses recorded results and needs no training."], confidence="runtime_bound")
+                      basis=["Diagnostic task uses the frozen checkpoint for CPU inference if its full export is missing; no training."
+                             if request.get("profile") == "full_retrieval" else
+                             "Diagnostic task reuses recorded development exports; no inference or training."], confidence="runtime_bound")
         return result
-    execution = observation.get("research_execution") or (observation.get("goal") or {}).get("research_execution") or {}
-    task_budget = execution.get("budget") or {}
-    envelope = (task_budget.get("envelopes") or {}).get(kind) or {}
-    if "training_jobs" in envelope or "gpu_seconds" in envelope:
-        result["runtime_allocation_bound"] = {key: envelope.get(key) for key in ("training_jobs", "gpu_seconds")}
-        result["runtime_allocation_bound"].update(
-            basis=envelope.get("allocation_basis") or "explicit_task_envelope",
-            authority="maximum_runtime_allocation_not_cost_estimate")
     action = measurement_action(proposal, observation)
     costs = observation.get("action_cost_estimates") or {}
     entries = costs.get("by_action_target") or costs
@@ -115,26 +110,53 @@ def proposal_cost(proposal: dict, observation: dict) -> dict:
         result["confidence"] = entry.get("cost_confidence") or "unknown"
     camp_path = observation.get("_campaign_path")
     if camp_path and (Path(camp_path) / "method_search_manifest.json").is_file():
-        from .method_suite import manifest
+        from .method_suite import manifest, suite_gpu_estimate, training_for_target
         from .screening import phase_cost, suites_for_target, valid_scores
         camp = Path(camp_path)
         common = manifest(camp)
         if common.get("evaluation_schedule") == "screen_then_confirm":
-            controls = suites_for_target(camp, "baseline")
+            controls = suites_for_target(camp, "baseline", state=observation)
             b_done = [r["fold_id"] for r in valid_scores(camp, controls[-1])] if controls else []
-            suites = suites_for_target(camp, target) if target else []
-            c_done = [r["fold_id"] for r in valid_scores(camp, suites[-1])] if suites else []
+            if target == "baseline":
+                c_done = b_done
+                recipe = None
+            else:
+                suites = suites_for_target(camp, target, state=observation) if target else []
+                c_done = [r["fold_id"] for r in valid_scores(camp, suites[-1])] if suites else []
+                recipe = ((suites[-1].get("method") or {}).get("hook_spec") or {}).get("training") if suites else None
+                if target and recipe is None:
+                    recipe = training_for_target(camp, target)
             estimate = phase_cost(common, "confirmation_10fold" if kind == "confirmation" else "screening_2fold",
-                                  c_done, b_done, target=target or "unadmitted_method")
+                                  c_done, b_done, target=target or "unadmitted_method", candidate_training=recipe)
             result.update(known={k: estimate.get(k) for k in ("training_jobs", "gpu_seconds", "feedback_report_count")},
-                basis=["Frozen phase folds and verified completed candidate/control folds."], confidence="runtime_bound")
+                basis=["Frozen phase folds and verified completed candidate/control folds; GPU forecast uses approved training epochs when available."],
+                confidence="rough")
         else:
             baseline = any(r.get("candidate_id") == "baseline" and r.get("kind") == "method_suite"
                            and r.get("evaluation_valid") for r in observation.get("evidence") or [])
             jobs = 10 if target == "baseline" or baseline else 20
-            result.update(known={"training_jobs": jobs, "gpu_seconds": common["gpu_seconds_estimate_per_suite"] * jobs / 10,
+            recipe = training_for_target(camp, target) if target else None
+            gpu = common["gpu_seconds_estimate_per_suite"] * jobs / 10
+            if recipe:
+                gpu = suite_gpu_estimate(common, recipe) + (0 if baseline else common["gpu_seconds_estimate_per_suite"])
+            result.update(known={"training_jobs": jobs, "gpu_seconds": gpu,
                                "feedback_report_count": 1},
-                basis=["Frozen full suite plus required matched baseline if absent."], confidence="runtime_bound")
+                basis=["Frozen full suite plus required matched baseline if absent; GPU forecast uses approved training epochs when available."],
+                confidence="rough")
+        result["unknown_components"] = ["candidate_runtime_multiplier"]
+        if kind == "new_method":
+            # Preserve the existing admission forecast exactly. The Planner's
+            # method prose is not an approved recipe or a measured runtime.
+            result["planning_envelope_cost"] = copy.deepcopy(result["known"])
+            result["predicted"]["reference_cost"] = {
+                "gpu_seconds_estimate": result["known"]["gpu_seconds"],
+                "reference_method": "baseline",
+                "reference_epochs": common["folds"][0]["protocol"]["full_epochs"],
+                "assumption": "Candidate uses the frozen baseline training length and per-fold throughput; required uncached baseline work is included. This is not a candidate runtime estimate.",
+                "confidence": "rough"}
+            result["known"]["gpu_seconds"] = None
+            result["confidence"] = "unknown"
+            result["unknown_components"].insert(0, "candidate_training_recipe")
     # Implementation forecasts stay honest and differentiated by scope/history.
     result["predicted"]["implementation"] = {"required": kind == "new_method",
         "scientific_intent": proposal["scientific_intent"],
@@ -143,13 +165,13 @@ def proposal_cost(proposal: dict, observation: dict) -> dict:
     return result
 
 
-def _check_basis(ids: list[str], observation: dict) -> None:
-    """Basis IDs name delivered observations only; absent delivery sets (legacy replay) are not guessed."""
+def _check_basis(ids: list[str], observation: dict, *, field: str = "basis_observation_ids") -> None:
+    """Scientific history references name delivered observations; legacy delivery is not guessed."""
     if len(set(ids)) != len(ids):
-        raise ValueError("basis_observation_ids_duplicate")
+        raise ValueError(field + "_duplicate")
     delivered = observation.get("_delivered_observation_ids")
     if delivered is not None and any(item not in delivered for item in ids):
-        raise ValueError("basis_observation_id_not_delivered")
+        raise ValueError(field.removesuffix("s") + "_not_delivered")
 
 
 def _validate_proposal(raw: Any, observation: dict) -> tuple[dict | None, dict]:
@@ -162,7 +184,12 @@ def _validate_proposal(raw: Any, observation: dict) -> tuple[dict | None, dict]:
                 raise ValueError("new_method_cannot_overwrite_existing_candidate")
             if not any(a in observation.get("available_actions", []) for a in ("design_experiment", "propose_experiment")):
                 raise ValueError("new_method_admission_unavailable")
+            from .planning_contract import parent_catalog
+            if item.get("parent_ref") not in {row["parent_ref"] for row in parent_catalog(observation)}:
+                raise ValueError("new_method_parent_missing_or_unavailable")
         else:
+            if item.get("parent_ref") is not None:
+                raise ValueError("existing_method_task_cannot_select_parent")
             from .planner import known_candidate_ids
             if not target or target not in known_candidate_ids(observation):
                 raise ValueError("target_candidate_missing_or_unknown")
@@ -191,6 +218,7 @@ def _validate_proposal(raw: Any, observation: dict) -> tuple[dict | None, dict]:
             source = registry.get(ref, role="research_planner")
             registry.load(source, role="research_planner")
         _check_basis(item.get("basis_observation_ids") or [], observation)
+        _check_basis(item.get("comparison_observation_ids") or [], observation, field="comparison_observation_ids")
         if phase != "diagnostic" and observation.get("evaluation_mode") == "loso_method_search":
             folds = item["evaluation_scope"].get("folds")
             expected = 2 if phase == "screening_2fold" else 10
@@ -245,7 +273,7 @@ def freeze_proposal_pool(proposals: list[dict], observation: dict, *,
     for raw in proposals:
         proposal, trace = _validate_proposal(raw, observation)
         if proposal is not None:
-            keys = ("task_kind", "target_candidate_ref", "scientific_intent", "evaluation_scope", "task_description")
+            keys = ("task_kind", "target_candidate_ref", "parent_ref", "scientific_intent", "evaluation_scope", "task_description")
             if proposal["task_kind"] != "new_method":
                 keys += ("question",)
             signature = digest({key: proposal.get(key) for key in keys})

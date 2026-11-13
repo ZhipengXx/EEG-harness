@@ -19,11 +19,12 @@ def _sha(p:Path)->str:
 def _validated_report(camp:Path,latest:dict[str,Any],ref:str)->tuple[dict,dict,dict]:
  from react_agent.eeg_research.agentic.artifacts import resolve_verified_artifact
  record=resolve_verified_artifact(camp,ref);report=_read(Path(record['path']))
- protocol=_read(camp/'execution_protocol.json');
- from react_agent.eeg_research.agentic.development_scope import development_scope
- scope=development_scope(protocol);job=Path(str(latest.get('job_dir') or ''))
+ job=Path(str(latest.get('job_dir') or ''))
  if not job.resolve().is_relative_to(camp.resolve()):raise ValueError('job_outside_campaign')
  j=_read(job/'job.json');frozen=_read(job/'frozen_run_spec.json');hook=_read(job/'hook_config.json');source=_read(job/'source_binding.json');metrics=_read(job/'metrics.json')
+ protocol=_read(Path(j['protocol_path'])) if j.get('protocol_path') else _read(camp/'execution_protocol.json')
+ from react_agent.eeg_research.agentic.development_scope import development_scope
+ scope=development_scope(protocol)
  if j.get('status')!='finished' or metrics.get('test_result') is not None:raise ValueError('run_not_development_finished')
  if not (latest.get('seed')==j.get('seed')==frozen.get('seed')==hook.get('seed')):raise ValueError('seed_identity_mismatch')
  if latest.get('spec_hash')!=frozen.get('spec_hash'):raise ValueError('run_spec_hash_mismatch')
@@ -31,11 +32,11 @@ def _validated_report(camp:Path,latest:dict[str,Any],ref:str)->tuple[dict,dict,d
  source_path=Path(str(source.get('class_file') or ''));source_path=source_path if source_path.is_absolute() else job/source_path
  if _sha(source_path)!=source.get('file_sha256') or source.get('file_sha256')!=latest.get('source_hash'):raise ValueError('run_source_changed')
  if report.get('final_test_accessed') is not False or report.get('gpu_seconds')!=0:raise ValueError('diagnostic_scope_invalid')
- if report.get('execution_fingerprint')!=protocol['fingerprint'] or latest.get('execution_fingerprint')!=protocol['fingerprint']:raise ValueError('protocol_identity_mismatch')
  if sorted(str(Path(row['path']).resolve()) for row in report.get('input_files') or [])!=scope['input_files']:raise ValueError('development_files_mismatch')
  if _sha(Path(report['predictions_csv_ref']))!=report['predictions_csv_sha256']:raise ValueError('prediction_artifact_changed')
  run=next((row for row in report.get('runs') or [] if row.get('job_id')==j.get('job_id')),None)
  if not run or run.get('candidate_id')!=j.get('candidate_id') or run.get('seed')!=j['seed']:raise ValueError('diagnostic_run_identity_mismatch')
+ if (run.get('execution_fingerprint') or report.get('execution_fingerprint'))!=protocol['fingerprint'] or latest.get('execution_fingerprint')!=protocol['fingerprint']:raise ValueError('protocol_identity_mismatch')
  for name in ('checkpoint','source_binding','frozen_run_spec'):
   path=job/('last.ckpt' if name=='checkpoint' else name+'.json')
   if run.get(name+'_sha256')!=_sha(path):raise ValueError(name+'_changed')
@@ -108,8 +109,9 @@ def _parent_comparison(camp:Path,state:dict,latest:dict,child_report:dict,child_
  parent=str(spec.get('ablation_of_candidate_id') or spec.get('parent_candidate_id') or '')
  if not parent or parent=='baseline':return None
  if parent!=binding.get('parent_candidate_id'):raise ValueError('declared_parent_identity_mismatch')
- matches=[row for row in state.get('evidence') or [] if row.get('evaluation_valid') is True and row.get('candidate_id')==parent
-          and row.get('fidelity')==latest['fidelity'] and row.get('seed')==latest['seed'] and row.get('execution_fingerprint')==latest.get('execution_fingerprint')]
+ from react_agent.eeg_research.agentic.runner import comparable
+ matches=[row for row in state.get('evidence') or [] if row.get('candidate_id')==parent
+          and row.get('fidelity')==latest['fidelity'] and row.get('seed')==latest['seed'] and comparable(row,latest)]
  if not matches:raise ValueError('same_seed_parent_full_missing')
  previous=matches[-1]
  from react_agent.eeg_research.agentic.handoffs import analysis_experiment_binding
@@ -118,10 +120,11 @@ def _parent_comparison(camp:Path,state:dict,latest:dict,child_report:dict,child_
  parent_artifact,parent_report,parent_run=_ensure_report(camp,state,previous)
  metadata={'hooks','note','note_zh','description','reuse','change_summary'};parent_binding=_read(camp/'candidates'/parent/'approved_binding.json')
  semantic=lambda value,section:{key:item for key,item in (value.get(section) or {}).items() if key not in metadata}
- changed=[section for section in ('model','objective','transform') if semantic(binding,section)!=semantic(parent_binding,section)]
- if len(changed)!=1:raise ValueError('ablation_not_single_config_section')
+ changed=[section for section in ('model','objective','transform','training') if semantic(binding,section)!=semantic(parent_binding,section)]
+ if spec.get('ablation_of_candidate_id')==parent and len(changed)!=1:raise ValueError('ablation_not_single_config_section')
  child_recipe=child_run.get('frozen_recipe') or {};parent_recipe=parent_run.get('frozen_recipe') or {}
- if child_recipe!=parent_recipe:raise ValueError('paired_frozen_recipe_mismatch')
+ from react_agent.eeg_research.agentic.execution_protocol import evaluation_comparison_config
+ if evaluation_comparison_config(child_recipe)!=evaluation_comparison_config(parent_recipe):raise ValueError('paired_evaluation_recipe_mismatch')
  query_count=child_run['scores']['query_count'];gallery_size=child_run['scores']['candidate_count']
  left=_predictions(child_report,latest['job_id'],query_count);right=_predictions(parent_report,previous['job_id'],query_count)
  if set(left)!=set(right):raise ValueError('paired_query_ids_mismatch')
@@ -149,7 +152,8 @@ def _parent_comparison(camp:Path,state:dict,latest:dict,child_report:dict,child_
   'candidate_source_hash':latest['source_hash'],'parent_source_hash':previous['source_hash'],
   'candidate_spec_hash':latest['spec_hash'],'parent_spec_hash':previous['spec_hash'],
   'candidate_diagnostic_ref':child_artifact['artifact_id'],'parent_diagnostic_ref':parent_artifact['artifact_id'],
-  'changed_hook_config_sections':changed,'frozen_recipe_identical':True,'training_statistics_retained':retained_stats,
+  'changed_hook_config_sections':changed,'frozen_recipe_identical':child_recipe==parent_recipe,
+  'candidate_training_recipe':child_recipe,'parent_training_recipe':parent_recipe,'training_statistics_retained':retained_stats,
   'capabilities_used':used,'query_count':query_count,'gallery_size':gallery_size,'paired_top1_counts':counts,'candidate_minus_parent_pp':100*difference,
   'candidate_top1':child_run['scores']['fixed_bank_top1'],'parent_top1':parent_run['scores']['fixed_bank_top1'],
   'baseline_comparison':latest.get('comparison'),'limits':['Single-seed paired development observation does not establish cross-seed reliability.','Identical training stopping policies allow different selected checkpoints and realized epochs.','These source subjects contributed training data; this is not unseen-subject accuracy.'],

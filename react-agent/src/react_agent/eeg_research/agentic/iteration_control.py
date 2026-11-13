@@ -26,7 +26,8 @@ def maybe_complete_research(camp: Path, state: dict) -> bool:
         return False
     from .experiment_observations import ExperimentObservationStore
 
-    store = ExperimentObservationStore(camp)
+    verified_sources = {}
+    store = ExperimentObservationStore(camp, verified_sources=verified_sources)
     completed = []
     observations = set()
     for plan in plans:
@@ -53,8 +54,8 @@ def maybe_complete_research(camp: Path, state: dict) -> bool:
         # Index the final feedback even though no eleventh Planner request is
         # created. A real similarity failure remains a recoverable failure.
         try:
-            memory = retrieve(camp, query=planner_query(camp, state), state=state,
-                              role="research_planner", require_embedding=True)
+            memory = retrieve(camp, query=planner_query(camp, state, verified_sources=verified_sources), state=state,
+                              role="research_planner", require_embedding=True, verified_sources=verified_sources)
         except EmbeddingUnavailable as exc:
             raise ValueError("research_iteration_final_memory_unavailable:" + str(exc)) from exc
         if memory.get("degraded"):

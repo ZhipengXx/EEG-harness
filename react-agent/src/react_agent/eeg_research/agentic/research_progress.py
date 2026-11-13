@@ -151,7 +151,7 @@ def verified_seed_records(camp: Path, state: dict[str, Any], protocol: dict[str,
     from react_agent.eeg_research.agentic.execution_protocol import effective_config
     from react_agent.eeg_research.agentic.experiment_gate import ExperimentResolutionError
     from react_agent.eeg_research.agentic.jobs import baseline_manifest
-    from react_agent.eeg_research.agentic.run_context import build_frozen_run_spec
+    from react_agent.eeg_research.agentic.run_context import build_frozen_run_spec, resolve_execution_protocol
     records = []
     for row in state.get('evidence') or []:
         if row.get('evaluation_valid') is not True or type(row.get('seed')) is not int or row.get('fidelity') not in {'pilot', 'full'}:
@@ -177,11 +177,12 @@ def verified_seed_records(camp: Path, state: dict[str, Any], protocol: dict[str,
             source_path = Path(str(binding.get('class_file') or ''))
             if not source_path.is_absolute():
                 source_path = job / source_path
-            config = effective_config(protocol, fidelity, training_seed=seed)
+            method_protocol = resolve_execution_protocol(camp, target, protocol, binding=expected["approved_binding"])
+            config = effective_config(method_protocol, fidelity, training_seed=seed)
             if (not source or row.get('source_hash') != source or row.get('spec_hash') != expected['spec_hash']
                     or row.get('execution_fingerprint') != expected['evaluation_hash']
                     or any(frozen.get(key) != expected.get(key) for key in
-                           ('target_id', 'spec_hash', 'model', 'objective', 'transform', 'recipe', 'evaluation_hash', 'run_config_hash'))
+                           ('target_id', 'spec_hash', 'model', 'objective', 'transform', 'training', 'recipe', 'evaluation_hash', 'run_config_hash'))
                     or record.get('status') != 'finished' or record.get('candidate_id') != target
                     or record.get('seed') != seed or record.get('fidelity') != fidelity
                     or record.get('effective_config') != config
@@ -237,17 +238,22 @@ def remaining_confirmation_work(camp: Path, state: dict[str, Any], protocol: dic
 
 
 def progress_context(camp: Path, state: dict[str, Any], goal: dict[str, Any],
-                     budget: dict[str, Any], actions: list[str]) -> dict[str, Any]:
+                     budget: dict[str, Any], actions: list[str], *,
+                     verified_screenings: list[dict] | None = None,
+                     verified_complete: list[dict] | None = None,
+                     phase_targets: dict | None = None) -> dict[str, Any]:
     """Count applied full-fidelity mechanisms from accepted, source-bound jobs."""
     if goal.get("evaluation_mode") == "loso_method_search":
         if goal.get("evaluation_schedule") == "screen_then_confirm":
             from react_agent.eeg_research.agentic.screening import progress_context as phase_progress
-            return phase_progress(camp, state, goal, budget, actions)
+            return phase_progress(camp, state, goal, budget, actions,
+                verified_screenings=verified_screenings, verified_complete=verified_complete,
+                phase_targets=phase_targets)
         from react_agent.eeg_research.agentic.method_suite import verified_suite_records
         from react_agent.eeg_research.agentic.planner import (
             IMPLEMENT_CALLS, _number, design_block_reason, training_block_reason,
         )
-        records = verified_suite_records(camp, state)
+        records = verified_suite_records(camp, state) if verified_complete is None else verified_complete
         controls = {row["evidence_id"]: row for row in records if row.get("candidate_id") == "baseline"
                     and row.get("seed") == 0 and row.get("fidelity") == "full"}
         pairs = []
@@ -346,7 +352,7 @@ def progress_context(camp: Path, state: dict[str, Any], goal: dict[str, Any],
         spec=(_read(camp/'candidates'/target/'spec.json').get('experiment') or {})
         if (approved.get('spec_hash')!=frozen.get('spec_hash')
                 or approved.get('source_hash')!=binding.get('file_sha256')
-                or any((approved.get(k) or {})!=(frozen.get(k) or {}) for k in ('model','objective','transform'))
+                or any((approved.get(k) or {})!=(frozen.get(k) or {}) for k in ('model','objective','transform','training'))
                 or (approved.get('approval_record') or {}).get('status')!='approved'):
             invalid.append(name);continue
         executed[target]={'spec':spec,'binding':approved,
@@ -384,12 +390,13 @@ def progress_context(camp: Path, state: dict[str, Any], goal: dict[str, Any],
         if parent!='baseline' and spec.get('ablation_of_candidate_id')==parent:
             parent_binding=_read(camp/'candidates'/parent/'approved_binding.json')
             metadata={'hooks','note','note_zh','description','reuse','change_summary'}
-            sections=('model','objective','transform')
+            sections=('model','objective','transform','training')
             semantic=lambda b,k:{key:value for key,value in (b.get(k) or {}).items() if key not in metadata}
             changed=[key for key in sections if semantic(approved,key)!=semantic(parent_binding,key)]
+            from .runner import _row_fingerprint
             matched_parent=any(e.get('candidate_id')==parent and e.get('evaluation_valid') is True
                          and e.get('fidelity')==row['fidelity'] and e.get('seed')==seed
-                         and e.get('execution_fingerprint')==row.get('execution_fingerprint')
+                         and _row_fingerprint(e)==_row_fingerprint(row)
                          for e in state.get('evidence') or [])
             if len(changed)==1 and matched_parent:effective.append('controlled_ablation')
         destination=coverage if row['fidelity']=='full' else pilot_coverage

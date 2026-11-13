@@ -50,92 +50,29 @@ def is_analysis_scientific_input(role: str, payload: dict[str, Any]) -> bool:
             and payload.get("analysis_context_version") == "research_analysis_input.v1")
 
 
-def _analysis_diagnostic_view(value: Any) -> Any:
-    """Remove known export bookkeeping only inside native diagnostic nodes."""
-    if isinstance(value, list):
-        return [_analysis_diagnostic_view(item) for item in value]
-    if not isinstance(value, dict):
-        return copy.deepcopy(value)
-    local = {"schema_version", "source_sha256", "source_hash", "spec_hash", "config_hash",
-        "checkpoint_hash", "protocol_hash", "evaluator_hash", "evaluation_key", "fingerprint", "artifact_sha256",
-        "validation_identity", "training_inference_identity_fingerprint", "dependencies",
-        "source_bindings", "created_at", "recorded_at"}
-    return {key: Path(item).name if key in {"checkpoint", "checkpoint_id"} and isinstance(item, str)
-            else _analysis_diagnostic_view(item) for key, item in value.items() if key not in local}
-
-
-def _analysis_training_run(run: dict[str, Any]) -> dict[str, Any]:
-    result = {key: copy.deepcopy(value) for key, value in run.items() if key not in {
-        "source_hash", "spec_hash", "config_hash", "method_revision", "suite_id", "suite_hash", "job_id"}}
-    config = result.get("config")
-    if isinstance(config, dict) and isinstance(config.get("recipe"), dict):
-        # Model/objective/transform keys are scientific configuration and are
-        # intentionally untouched, even if a custom parameter is called hash.
-        config["recipe"] = {key: value for key, value in config["recipe"].items()
-                            if key not in {"data_root", "gpu"}}
-    for key in ("training_execution", "development_diagnostics", "checkpoint_selection", "development_metrics"):
-        if key in result:
-            result[key] = _analysis_diagnostic_view(result[key])
-    diagnostics = result.get("development_diagnostics")
-    items = diagnostics.get("items") if isinstance(diagnostics, dict) else None
-    dynamics = items.get("training_dynamics") if isinstance(items, dict) else None
-    if (isinstance(dynamics, dict) and "training_execution" in result
-            and dynamics.get("training_execution") == result["training_execution"]):
-        # Native exports repeat this record inside training dynamics. Deliver
-        # the identical scientific facts once; keep any differing observation.
-        dynamics.pop("training_execution", None)
-    learning = result.get("development_learning")
-    if isinstance(learning, dict) and isinstance(learning.get("points"), list) and learning["points"]:
-        # Keep every epoch and metric without repeating the same JSON keys.
-        points = learning.pop("points")
-        columns = list(dict.fromkeys(key for row in points for key in row))
-        # A column recorded twice at different float precision is one curve.
-        equivalent = {}
-        for index, name in enumerate(columns):
-            same = next((kept for kept in columns[:index] if kept not in equivalent
-                         and _same_curve([row.get(kept) for row in points], [row.get(name) for row in points])), None)
-            if same is not None:
-                equivalent[name] = same
-        columns = [name for name in columns if name not in equivalent]
-        learning["columns"] = columns
-        learning["rows"] = [[_curve_value(row.get(key)) for key in columns] for row in points]
-        if equivalent:
-            learning["equivalent_columns"] = equivalent
-    return result
-
-
-def _curve_value(value: Any) -> Any:
-    # Four significant digits resolve every epoch-to-epoch change in these curves;
-    # the complete-precision rows remain readable through the cited local source.
-    return float(f"{value:.4g}") if isinstance(value, float) else value
-
-
-def _same_curve(left: list[Any], right: list[Any]) -> bool:
-    if not left or len(left) != len(right):
-        return False
-    for a, b in zip(left, right):
-        if isinstance(a, bool) or isinstance(b, bool) or not isinstance(a, (int, float)) or not isinstance(b, (int, float)):
-            return False
-        if abs(a - b) > 1e-6 * max(1.0, abs(a), abs(b)):
-            return False
-    return True
+def is_literature_input(role: str, payload: dict[str, Any]) -> bool:
+    from ..literature_contract import LITERATURE_ROLES
+    return role in LITERATURE_ROLES
 
 
 def project_analysis_scientific_input(payload: dict[str, Any]) -> dict[str, Any]:
-    """Scientific delivery only; native identities and provenance stay local."""
+    """Deliver the already-built summary; complete training facts stay local."""
     fields = ("analysis_context_version", "review_stage", "research_context", "analysis_requirements")
     result = {key: copy.deepcopy(payload[key]) for key in fields if key in payload}
     facts = payload.get("analysis_facts") or {}
-    result["analysis_facts"] = {key: copy.deepcopy(facts[key]) for key in (
-        "measurement", "coverage", "evaluation_context", "training_runs", "scientific_diagnostics",
-        "source_catalog", "allowed_evidence_refs"
-    ) if key in facts}
-    if isinstance(result["analysis_facts"].get("training_runs"), list):
-        result["analysis_facts"]["training_runs"] = [_analysis_training_run(run)
-            for run in result["analysis_facts"]["training_runs"]]
-    if "scientific_diagnostics" in result["analysis_facts"]:
-        result["analysis_facts"]["scientific_diagnostics"] = _analysis_diagnostic_view(
-            result["analysis_facts"]["scientific_diagnostics"])
+    # A recovered provider view already has these three sections at this level.
+    # Neither path rebuilds the summary or reads the complete training records.
+    summary = facts.get("analysis_summary", facts)
+    result["analysis_facts"] = {key: copy.deepcopy(summary[key]) for key in (
+        "measurement", "training_summary", "diagnostic_summary", "diagnostic_task") if key in summary}
+    result["analysis_facts"].update({key: copy.deepcopy(facts[key]) for key in (
+        "coverage", "evaluation_context", "source_catalog", "allowed_evidence_refs") if key in facts})
+    if "historical_comparisons" in facts:
+        history = copy.deepcopy(facts["historical_comparisons"])
+        for row in history:
+            for key in ("evaluation_identity", "selection_manifest_hash", "baseline_suite_hash"):
+                (row.get("conditions") or {}).pop(key, None)
+        result["analysis_facts"]["historical_comparisons"] = history
     for key in ("previous_response_error", "previous_response"):
         if key in payload:
             result[key] = copy.deepcopy(payload[key])
@@ -186,7 +123,7 @@ def render_role_system(role: str, system: str, *, instructions: Any = None, sche
     independent_planning = (role in {"research_planner", "research_critic"}
                             and execution_version == "single_plan_v1"
                             and planning_mode == "propose_then_critic")
-    if role == "experiment_designer" or compact_engineering or compact_analysis:
+    if role == "experiment_designer" or compact_engineering or compact_analysis or is_literature_input(role, {}):
         # The explicit Designer view contains scientific constraints, not a
         # ledger/delivery protocol or tool for following context read handles.
         return system
@@ -374,7 +311,8 @@ class ContextCompiler:
         scientific_planning = is_research_planning_input(request.role, request.payload)
         scientific_designer = is_designer_scientific_input(request.role, request.payload)
         scientific_analysis = is_analysis_scientific_input(request.role, request.payload)
-        exact_science = scientific_planning or scientific_designer or scientific_analysis or is_engineering_input(request.role, request.payload)
+        literature = is_literature_input(request.role, request.payload)
+        exact_science = scientific_planning or scientific_designer or scientific_analysis or literature or is_engineering_input(request.role, request.payload)
         self.registry = ContextSourceRegistry(self.camp, request.campaign_id)
         self.snapshot_store = None
         # The staged builder already selects the required scientific context.
@@ -390,11 +328,11 @@ class ContextCompiler:
             if isinstance(section, dict):
                 for key in ("memory_retrieval_health", "memory_delivery_report", "memory_delivery_report_ref"):
                     section.pop(key, None)
-        if request.examples and not scientific_analysis:
+        if request.examples and not scientific_analysis and not literature:
             merged_input["current_examples"] = copy.deepcopy(list(request.examples))
-        if request.feedback is not None and not scientific_analysis:
+        if request.feedback is not None and not scientific_analysis and not literature:
             merged_input["current_feedback"] = copy.deepcopy(request.feedback)
-        if request.retrieved and not scientific_analysis:
+        if request.retrieved and not scientific_analysis and not literature:
             merged_input["retrieved_context"] = copy.deepcopy(list(request.retrieved))
         if snapshot_delivery:
             merged_input["working_snapshot"] = snapshot_delivery
@@ -754,6 +692,7 @@ class ContextCompiler:
             if exact_science:
                 return Blocked("engineering_input_exceeds_budget" if is_engineering_input(request.role, request.payload)
                     else "designer_input_exceeds_budget" if scientific_designer
+                    else "literature_input_exceeds_budget" if literature
                     else "analysis_input_exceeds_budget" if scientific_analysis else "research_planning_input_exceeds_budget",
                     {"role": request.role, "minimum_necessary_chars": report["chars"]}, report,
                     ("a smaller native scientific projection or larger authorized provider window",))

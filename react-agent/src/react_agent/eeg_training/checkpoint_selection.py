@@ -58,12 +58,12 @@ def validate_training_completion(
         selected_epochs = int(selected.get("last_epoch") or 0)
     except (TypeError, ValueError):
         return False, "method_suite_training_epochs_invalid"
-    if full_epochs != 50:
-        return False, "method_suite_requires_50_epochs"
+    if full_epochs < 1:
+        return False, "method_suite_training_epochs_invalid"
     overrides = (protocol.get("fidelity_overrides") or {}).get("full") or {}
-    if overrides.get("epochs") != 50 or overrides.get("stop") != "single_full" or protocol.get("checkpoint_policy") != "strict_best":
+    if overrides.get("epochs") != full_epochs or overrides.get("stop") != "single_full" or protocol.get("checkpoint_policy") != "strict_best":
         return False, "method_suite_training_policy_mismatch"
-    if metrics_epochs != 50 or selected_epochs != 50:
+    if metrics_epochs != full_epochs or selected_epochs != full_epochs:
         return False, "method_suite_training_incomplete"
     if selected.get("policy") != "strict_best" or selected.get("stop_reason") != "epochs_completed":
         return False, "method_suite_checkpoint_policy_mismatch"
@@ -76,6 +76,6 @@ def validate_training_completion(
         return False, "method_suite_checkpoint_selection_missing"
     if not all(math.isfinite(value) and 0 <= value <= 1 for value in (raw, saved, score)):
         return False, "method_suite_checkpoint_score_invalid"
-    if raw != saved or saved != score or not 1 <= epoch <= 50 or metrics.get("selected_checkpoint_epoch") != epoch:
+    if raw != saved or saved != score or not 1 <= epoch <= full_epochs or metrics.get("selected_checkpoint_epoch") != epoch:
         return False, "method_suite_checkpoint_selection_mismatch"
-    return True, "complete_fixed_50_epoch_training"
+    return True, "complete_declared_epoch_training"

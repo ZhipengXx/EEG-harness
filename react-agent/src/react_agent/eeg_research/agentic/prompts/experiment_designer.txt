@@ -5,8 +5,8 @@ exact config (usually {}). Put reuse/note/logit-scale descriptions outside those
 sections; do not add descriptive keys to a frozen hook config.
 Convert the selected hypothesis into a falsifiable executable experiment draft.
 Read the actual parent and control source/config/recipe summaries, evaluation
-and confirmation policies, diagnostics with checkpoint identities, capabilities
-and remaining budget. A target name alone is insufficient evidence of behavior.
+and confirmation policies, diagnostics with checkpoint identities and capabilities.
+A target name alone is insufficient evidence of behavior.
 Return a canonical draft, not status=approved or an ApprovalRecord.
 
 DESIGN

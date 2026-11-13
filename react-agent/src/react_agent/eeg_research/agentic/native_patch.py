@@ -51,10 +51,20 @@ def _check_fingerprint(workspace: Path, python: str | None, *, cpu_only: bool = 
     # check_entry consumes hook configs and declared implementation properties. Repair prose and artifact
     # receipts do not change the computation checked by this fingerprint.
     hook_config = {key: config.get(key) or {} for key in ("model", "objective", "transform")}
+    interface = json.loads(spec.read_text(encoding="utf-8")) if spec.is_file() else "eeg"
+    check_input = interface
+    if isinstance(interface, dict):
+        # The CPU fixture consumes geometry, not the training budget or the
+        # descriptive capability catalog. The GPU step also consumes its real
+        # batch partition and optimizer settings; an epoch-only change does not.
+        check_input = {key: interface.get(key) for key in ("c_num", "timesteps")}
+        if not cpu_only and isinstance(interface.get("multigpu_check"), dict):
+            check_input["multigpu_check"] = {key: value for key, value in interface["multigpu_check"].items()
+                                           if key not in {"protocol_fingerprint", "training_sample_count", "data_scope"}}
     payload = {
         "fingerprint_version": 5,
         "source": file_sha256(workspace / "extension" / "eeg_candidate.py"),
-        "input_spec": json.loads(spec.read_text(encoding="utf-8")) if spec.is_file() else "eeg",
+        "input_spec": check_input,
         "approved_hook_config": hook_config,
         "implementation_requirements": config.get("implementation_requirements") or [],
         "python": python or torch_python(),
@@ -66,7 +76,7 @@ def _check_fingerprint(workspace: Path, python: str | None, *, cpu_only: bool = 
         "objective_dispatch_reference": file_sha256(Path(__file__).resolve().parents[2] / "eeg_training" / "hooks.py"),
         "training_entry_reference": file_sha256(Path(__file__).resolve().parents[2] / "eeg_training" / "train_entry.py"),
     }
-    if _design_v2(assigned, payload["input_spec"] if isinstance(payload["input_spec"], dict) else None):
+    if _design_v2(assigned, interface if isinstance(interface, dict) else None):
         payload["check_scope"] = "cpu" if cpu_only else "complete"
         mapping = workspace / "implementation_map.json"
         binding = json.loads(mapping.read_text(encoding="utf-8")) if mapping.is_file() else {}
@@ -74,7 +84,19 @@ def _check_fingerprint(workspace: Path, python: str | None, *, cpu_only: bool = 
             key: row["probe"] for key, row in (binding.get("requirements") or {}).items() if row.get("probe")
         } if binding.get("source_sha256") == payload["source"] and binding.get("approved_spec_hash") == config.get("spec_hash") else {}
     if not cpu_only and isinstance(payload["input_spec"], dict) and (payload["input_spec"].get("multigpu_check") or {}).get("enabled"):
-        payload["multigpu_checker"] = file_sha256(Path(__file__).with_name("multigpu_check.py"))
+        manager = Path(__file__).with_name("multigpu_check.py")
+        payload["multigpu_checker"] = file_sha256(manager)
+        camp = workspace.parent.parent
+        if (camp / "runtime_dispatch_patch.json").is_file():
+            from .historical_runtime import dispatch_patch_matches
+            from .loso_study import read
+            prior = next((row for row in read(camp / "method_search_manifest.json")["framework_dependencies"]
+                          if row["path"] == str(manager.resolve())), None)
+            if prior and dispatch_patch_matches(camp, manager, prior["sha256"], payload["multigpu_checker"]):
+                # This fingerprint identifies the checked computation. The exact
+                # dispatch repair preserves it; new probe requests still record
+                # the manager source actually executed.
+                payload["multigpu_checker"] = prior["sha256"]
         payload["multigpu_probe"] = file_sha256(Path(__file__).with_name("multigpu_probe.py"))
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
@@ -147,6 +169,27 @@ def _run_v2_check(workspace: Path, python: str | None, *, complete: bool) -> dic
     result.pop("cached", None)  # A cached CPU result does not mean the final GPU check was cached.
     check_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     return result
+
+
+def implement_inherited(workspace: Path, source: str, *, python: str | None = None) -> dict[str, Any]:
+    """Publish a native recipe-only implementation through the existing check owner."""
+    entry = workspace / "extension/eeg_candidate.py"
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    if entry.is_file():
+        if entry.read_text(encoding="utf-8") != source:
+            raise RecoveryBlocked("inherited_candidate_source_changed")
+    else:
+        pending = entry.with_suffix(".py.tmp")
+        pending.write_text(source, encoding="utf-8")
+        pending.replace(entry)
+    check = _run_v2_check(workspace, python, complete=True)
+    if check.get("error") == "gpu_check_pending":
+        return {"status": "check_pending", "detail": "gpu_check_pending", "check": check, "steps": 0}
+    if not check.get("ok"):
+        return {"status": "implementation_failed", "detail": check.get("error") or "check_not_passed",
+                "check": check, "steps": 0}
+    result = finish_patch(workspace, "Inherited implementation; approved training recipe is applied by the native runner.")
+    return {"status": "ready_for_review", "manifest": result["manifest"], "check": check, "steps": 0}
 
 
 class RecoveryBlocked(RuntimeError):
@@ -425,7 +468,6 @@ def implement(
             if recovery is not None:
                 coding_recovery.save(workspace, recovery)
             return {"status": "ready_for_review", "manifest": result["manifest"], "check": last_check, "steps": next_step - 1}
-    extension_answered = bool(restored["extension_answered"])
     if recovery is not None and (recovery["steps_used"] >= step_limit or recovery["failed_checks_used"] >= recovery["failed_check_limit"]):
         return {"status": "implementation_failed", "detail": "coding_lineage_budget_exhausted", "check": last_check,
                 "steps": recovery["steps_used"], "coding_recovery": recovery}
@@ -531,9 +573,9 @@ def implement(
         elif last_check is not None and last_check.get("ok") and not check_fresh:
             request["runtime_note"] = "The stored check passed for an older fingerprint. Call run_candidate_check before finish_patch; rereading source or repeating finish cannot refresh the check."
         elif last_check is not None and last_check.get("ok"):
-            request["runtime_note"] = ("CPU checks passed. Finish the implementation with finish_patch; its native tool performs the final preflight."
+            request["runtime_note"] = ("CPU checks passed. Complete any remaining required source changes, including prior review fixes, before calling finish_patch; its native tool performs the final preflight."
                                        if design_v2 and last_check.get("check_scope") == "cpu" else
-                                       "The current check passed. Call finish_patch unless a required source change is missing.")
+                                       "The current check passed. Complete any remaining required source changes, including prior review fixes, before calling finish_patch.")
         latest_result = (history[-1].get("result") or {}) if history else {}
         if latest_result.get("error") in {"edit_not_found", "edit_not_unique", "base_hash_mismatch"}:
             feedback = request.get("edit_failure_context") or {}
@@ -592,7 +634,8 @@ def implement(
             else:
                 result = {"ok": False, "error": "design_revision_requires_v2"}
         elif tool == "finish_patch":
-            if design_v2 and entry.is_file() and file_sha256(entry) == last_hash:
+            source_exists = entry.is_file()
+            if design_v2 and source_exists and file_sha256(entry) == last_hash:
                 mapping_result = (_store_implementation_map(workspace, spec, args["implementation_map"])
                                   if "implementation_map" in args else {"ok": True})
                 if mapping_result.get("ok"):
@@ -603,11 +646,15 @@ def implement(
                 else:
                     result = mapping_result
             else:
-                fresh = entry.is_file() and file_sha256(entry) == last_hash
+                fresh = source_exists and file_sha256(entry) == last_hash
                 if fresh and last_check_fingerprint:
                     fresh = _check_fingerprint(workspace, python) == last_check_fingerprint
                 if not (fresh and last_check and last_check.get("ok")):
-                    result = {"ok": False, "error": "check_not_passed", "detail": "The current source and executable config must have a fresh passing check. Call run_candidate_check before finish_patch.", "next_tool": "run_candidate_check", "check_fresh": fresh}
+                    result = {"ok": False, "error": "check_not_passed", "check_fresh": fresh,
+                              "next_tool": "run_candidate_check" if source_exists else "apply_candidate_patch",
+                              "detail": ("The current source and executable config must have a fresh passing check. Call run_candidate_check before finish_patch."
+                                         if source_exists else
+                                         "The candidate source file does not exist. Call apply_candidate_patch to create extension/eeg_candidate.py before finish_patch; the native tool checks the delivered source.")}
                 else:
                     result = _execute(workspace, tool, args, last_check, python)
         elif tool == "run_candidate_check" and design_v2 and entry.is_file():
@@ -660,20 +707,6 @@ def implement(
                         key = _read_key(tool, execution_args, str(result.get("source_sha256") or revision))
                     seen_reads.add(key)
                     read_cache[key] = result
-        elif tool == "requires_framework_extension" and not extension_answered:
-            extension_answered = True
-            result = {
-                "ok": False,
-                "error": "interface_already_available",
-                "detail": (
-                    "build_encoder may return any torch.nn.Module defined in extension/eeg_candidate.py; "
-                    "it does not need to use or subclass EEGProjectLayer. Gallery, image cache, labels and split "
-                    "are runtime guarantees and must not be asserted by the candidate. Write the module now, or "
-                    "call requires_framework_extension again only if something outside candidate_interface is required."
-                ),
-                "candidate_interface": input_spec,
-            }
-            tool = "requires_framework_extension_answered"
         else:
             result = _execute(workspace, tool, args, last_check, python)
         if tool in _READ_TOOLS:
@@ -1184,7 +1217,8 @@ def review(
         "reviewer_model": model,
         "executor_model": model,
     }
-    if _design_v2(spec, interface):
+    design_v2 = _design_v2(spec, interface)
+    if design_v2:
         payload["review_mode"] = spec.get("review_mode", "full")
         payload["review_focus"] = spec.get("review_focus") or {}
         mapping = workspace / "implementation_map.json"
@@ -1201,7 +1235,8 @@ def review(
         "scope": "Reference these exact current identities in every core requirement coverage item.",
     }
     from react_agent.eeg_research.agentic.handoffs import training_semantics
-    payload["training_runtime_source"] = training_semantics()
+    payload["training_runtime_source"] = training_semantics(
+        review_spec=spec if design_v2 else None, checks=checks)
     parent = workspace / "reference/parent.py"
     if parent.is_file():
         from react_agent.eeg_research.agentic.artifacts import file_digest

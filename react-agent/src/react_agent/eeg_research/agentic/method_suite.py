@@ -13,6 +13,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from react_agent.eeg_research.agentic.loso_study import SUBJECTS, digest, folds, identity, read, write_once
+from .comparison import meets_gain_threshold
 
 MODE = "loso_method_search"
 METRIC = "benchmark.loso_mean_fixed_gallery_top1"
@@ -21,6 +22,49 @@ MANIFEST = "method_search_manifest.json"
 
 def enabled(state: dict) -> bool:
     return state.get("evaluation_mode") == MODE
+
+
+def completed_detached_suites(camp: Path, state: dict, *, historical_only: bool = True,
+                             required_target: str | None = None) -> dict[str, dict]:
+    """Select completed detachments from the lifecycle-synced native projection.
+
+    A damaged suite cannot identify itself as detached. The committed receipt,
+    native directory identity and completed detachment projection identify it
+    before its manifest is read. Current task dependencies still validate.
+    """
+    detached = state.get("detached_candidates") or {}
+    if not isinstance(detached, dict):
+        return {}
+    required_targets = {required_target}
+    if historical_only:
+        selected = state.get("selected_plan") or {}
+        if isinstance(selected, dict) and selected.get("status") not in {"observation_ready", "failed", "cancelled", "needs_replan"}:
+            required_targets.add(selected.get("candidate_id"))
+        experiment = state.get("experiment") or {}
+        required_targets.update(experiment.get(key) for key in (
+            "parent_candidate_id", "ablation_of_candidate_id", "control_candidate_id"))
+    result = {}
+    for target, receipt in detached.items():
+        if (target == "baseline" or target in required_targets or not isinstance(receipt, dict)
+                or receipt.get("candidate_id") != target or not receipt.get("suite_engineering_failure")):
+            continue
+        suite_id = receipt.get("suite_id")
+        if not isinstance(suite_id, str):
+            continue
+        parts = suite_id.rsplit("_", 3)
+        if (len(parts) != 4 or parts[0] != target or len(parts[1]) != 16
+                or any(char not in "0123456789abcdef" for char in parts[1]) or parts[2:] != ["seed0", "full"]):
+            continue
+        if historical_only and suite_id in {state.get("active_suite"), state.get("phase_target_suite")}:
+            continue
+        path = camp / "suites" / suite_id / "suite_state.json"
+        if not path.is_file():
+            continue
+        progress = read(path)
+        if (progress.get("status") == "abandoned" and receipt.get("receipt_hash")
+                and progress.get("detach_receipt") == receipt["receipt_hash"]):
+            result[suite_id] = progress
+    return result
 
 
 def validate_manifest_rows(rows: list[dict]) -> None:
@@ -35,15 +79,25 @@ def validate_manifest_rows(rows: list[dict]) -> None:
 
 
 def _framework_dependencies() -> list[dict]:
+    """Code bound to scientific execution, including mixed execution modules."""
     root = Path(__file__).resolve().parents[2]
     paths = [*sorted((root / "eeg_training").glob("*.py")),
              *[Path(__file__).parent / name for name in (
                  "baseline.py", "jobs.py", "runner.py", "execution_protocol.py", "run_context.py",
                  "method_suite.py", "method_evaluate.py", "check_entry.py", "implementation_semantics.py",
-                 "multigpu_check.py", "multigpu_probe.py", "process_identity.py", "coder.py", "interface.py")]]
-    # New phase logic participates in newly created protocol provenance. Old
-    # manifests keep their original exact dependency rows and remain strict.
-    paths.extend(Path(__file__).parent / name for name in ("screening.py", "budget.py", "jsonl_read.py"))
+                 "multigpu_check.py", "multigpu_probe.py", "interface.py", "screening.py")]]
+    return [{"path": str(path), "sha256": digest(path)} for path in paths]
+
+
+def _management_provenance() -> list[dict]:
+    """Creation-time source record, not a requirement on the current checkout.
+
+    These tools manage jobs, candidate edits and diagnostic reads. Actual
+    training completion, candidate source and frozen result artifacts remain
+    bound separately. Existing manifests retain their original dependencies.
+    """
+    paths = [Path(__file__).parent / name for name in
+             ("budget.py", "process_identity.py", "coder.py", "jsonl_read.py")]
     return [{"path": str(path), "sha256": digest(path)} for path in paths]
 
 
@@ -51,11 +105,11 @@ def create_manifest(camp: Path, design, *, allow_shared_gpus: bool = False, esti
     from react_agent.eeg_research.agentic.execution_protocol import build_execution_protocol
     from react_agent.eeg_research.agentic.loso_study import gpu_inventory
     from react_agent.eeg_training.protocol import list_subjects, split_plan, feature_cache
-    if design.evaluation_mode != MODE or design.epochs != 50 or design.stop != "single_full" or design.checkpoint_policy != "strict_best":
+    if design.evaluation_mode != MODE or design.epochs < 1 or design.stop != "single_full" or design.checkpoint_policy != "strict_best":
         raise ValueError("method_search_training_policy_mismatch")
     base = Path(design.data_root)
-    if tuple(list_subjects(base, "eeg")) != SUBJECTS or len(design.gpu) < 2:
-        raise ValueError("method_search_requires_ten_subjects_and_multiple_gpus")
+    if tuple(list_subjects(base, "eeg")) != SUBJECTS or not design.gpu:
+        raise ValueError("method_search_requires_ten_subjects_and_at_least_one_gpu")
     rows = []
     for fold in folds():
         fold_design = replace(design, subject=",".join(fold["train_subjects"]))
@@ -79,7 +133,8 @@ def create_manifest(camp: Path, design, *, allow_shared_gpus: bool = False, esti
             "folds": rows, "seed": 0, "fidelity": "full", "required_fold_count": 10,
             "gpu": list(design.gpu), "gpu_inventory": gpu_inventory(design.gpu, allow_shared=allow_shared_gpus),
             "data_dependencies": dependencies, "cache_dependencies": caches,
-            "framework_dependencies": _framework_dependencies(), "gpu_seconds_estimate_per_suite": estimate,
+            "framework_dependencies": _framework_dependencies(), "management_provenance": _management_provenance(),
+            "gpu_seconds_estimate_per_suite": estimate,
             "benchmark_permission": {"authorized": True, "data_role": "method_development_benchmark",
                                      "purpose": "complete_method_suite_feedback", "partial_feedback": False,
                                      "training_access": False, "checkpoint_selection": "source_subject_development_only"},
@@ -121,19 +176,46 @@ def manifest(camp: Path) -> dict:
     return body
 
 
-def verify_dependencies(rows: list[dict]) -> None:
+def verify_dependencies(rows: list[dict], *, camp: Path | None = None) -> None:
     for row in rows:
-        if digest(Path(row["path"])) != row["sha256"]:
+        actual = digest(Path(row["path"]))
+        if actual != row["sha256"]:
+            from .historical_runtime import dispatch_patch_matches
+            if camp is not None and dispatch_patch_matches(camp, Path(row["path"]), row["sha256"], actual):
+                continue
             raise ValueError("method_suite_dependency_changed:" + Path(row["path"]).name)
+
+
+def training_for_target(camp: Path, target: str) -> dict | None:
+    """Read the already-approved recipe for cost projections, without a probe."""
+    if target == "baseline":
+        return None
+    from .run_context import load_approved_binding
+    binding = load_approved_binding(camp, target)
+    return binding.get("training") if binding else None
+
+
+def suite_gpu_estimate(common: dict, training: dict | None = None) -> float:
+    """Scale the existing rough estimate by declared training length.
+
+    Architecture and batch-dependent throughput remain estimates; actual GPU
+    accounting continues to come from the job ledger.
+    """
+    estimate = common["gpu_seconds_estimate_per_suite"]
+    if training:
+        baseline_epochs = common["folds"][0]["protocol"]["full_epochs"]
+        estimate *= training["epochs"] / baseline_epochs
+    return estimate
 
 
 def _method(camp: Path, target: str, state: dict) -> dict:
     from react_agent.eeg_research.agentic.jobs import baseline_manifest
-    from react_agent.eeg_research.agentic.run_context import build_frozen_run_spec
+    from react_agent.eeg_research.agentic.run_context import build_frozen_run_spec, resolve_execution_protocol
     from react_agent.eeg_research.agentic.execution_protocol import load_protocol
     from react_agent.eeg_research.agentic.experiment_gate import resolve_approved_experiment
     from react_agent.eeg_research.agentic.multigpu_check import run_multigpu_check, validate_receipt, refresh_probe_budget
     protocol = load_protocol(camp)
+    protocol = resolve_execution_protocol(camp, target, protocol)
     frozen = build_frozen_run_spec(camp, target, state, fidelity="full", seed=0, protocol=protocol)
     if target == "baseline":
         source = baseline_manifest()
@@ -183,7 +265,7 @@ def validate_suite(camp: Path, suite_id: str, *, verify_data: bool = False,
     parent = manifest(camp)
     if body["manifest_hash"] != parent["manifest_hash"]:
         raise ValueError("method_suite_parent_mismatch")
-    verify_dependencies(body["method"]["dependencies"] + parent["framework_dependencies"])
+    verify_dependencies(body["method"]["dependencies"] + parent["framework_dependencies"], camp=camp)
     if verify_data:
         verify_dependencies(parent["data_dependencies"] + parent["cache_dependencies"])
     validate_manifest_rows(body["folds"])
@@ -216,40 +298,30 @@ def begin(camp: Path, state: dict, target: str, *, phase: str | None = None) -> 
 
 
 def _begin_full(camp: Path, state: dict, target: str, *, phase_preparation: bool = False) -> str:
-    from react_agent.eeg_research.agentic.budget import reserve_gpu
     if state.get("active_suite"):
         raise ValueError("method_suite_already_active")
     if not phase_preparation and target != "baseline" and not any(row.get("kind") == "method_suite" and row.get("candidate_id") == "baseline"
                                         and row.get("evaluation_valid") for row in state.get("evidence") or []):
         raise ValueError("complete_baseline_suite_required")
     common = manifest(camp)
-    # Reject a new method before spending on its engineering probe when the
-    # complete ten-fold execution cannot be reserved. Existing suites recover
-    # from their immutable manifests without reserving ten fresh job slots.
-    existing = any(read(path).get("method", {}).get("candidate_id") == target
-                   for path in (camp / "suites").glob("*/suite_manifest.json"))
-    if not existing and not phase_preparation:
-        if state["max_training_jobs"] - state["training_jobs"] < 10:
-            raise ValueError("method_suite_requires_ten_job_slots")
-        if common["gpu_seconds_estimate_per_suite"] > float(state.get("gpu_seconds_left", 0)) - float(state.get("gpu_seconds_reserved", 0)):
-            raise ValueError("method_suite_gpu_reservation_unavailable")
     method = _method(camp, target, state)
     suite_id = target + "_" + method["method_revision"][:16] + "_seed0_full"
     suite_dir = camp / "suites" / suite_id
     if (suite_dir / "suite_manifest.json").exists():
         validate_suite(camp, suite_id)
         state["active_suite"] = suite_id
+        state["method_jobs_reserved"] = 0
+        state["gpu_seconds_reserved"] = 0.0
+        state.pop("method_gpu_reservation", None)
         return suite_id
-    if not phase_preparation and state["max_training_jobs"] - state["training_jobs"] < 10:
-        raise ValueError("method_suite_requires_ten_job_slots")
-    estimate = common["gpu_seconds_estimate_per_suite"]
-    if not phase_preparation and estimate > float(state.get("gpu_seconds_left", 0)) - float(state.get("gpu_seconds_reserved", 0)):
-        raise ValueError("method_suite_gpu_reservation_unavailable")
     verify_dependencies(method["dependencies"] + common["framework_dependencies"] +
-                        common["data_dependencies"] + common["cache_dependencies"])
+                        common["data_dependencies"] + common["cache_dependencies"], camp=camp)
+    from .execution_protocol import with_training_recipe
     rows = []
     for fold in common["folds"]:
-        protocol = {**fold["protocol"], "method_revision": method["method_revision"],
+        fold_protocol = (with_training_recipe(fold["protocol"], method["hook_spec"]["training"])
+                         if method["hook_spec"].get("training") else fold["protocol"])
+        protocol = {**fold_protocol, "method_revision": method["method_revision"],
                     "method_suite_id": suite_id, "method_suite_ref": str((suite_dir / "suite_manifest.json").resolve()),
                     "fold_id": fold["fold_id"], "benchmark_subject": fold["held_out_subject"]}
         protocol["fingerprint"] = identity({k: v for k, v in protocol.items() if k != "fingerprint"})
@@ -272,13 +344,12 @@ def _begin_full(camp: Path, state: dict, target: str, *, phase_preparation: bool
     write_once(suite_dir / "suite_manifest.json", body)
     if not (suite_dir / "suite_state.json").exists():
         write_once(suite_dir / "suite_state.json", {"status": "pending", "jobs": {}, "completed_folds": []})
-    if not phase_preparation and not reserve_gpu(state, estimate):
-        raise ValueError("method_suite_gpu_reservation_unavailable")
     state["active_suite"] = suite_id
     state["status"] = "training"
     if not phase_preparation:
-        state["method_jobs_reserved"] = 10
-        state["method_gpu_reservation"] = estimate
+        state["method_jobs_reserved"] = 0
+        state["gpu_seconds_reserved"] = 0.0
+        state.pop("method_gpu_reservation", None)
     return suite_id
 
 
@@ -400,16 +471,28 @@ def aggregate_records(suite: dict, scores: list[dict]) -> dict:
     return body
 
 
-def read_aggregate(camp: Path, suite_id: str) -> dict:
-    suite = validate_suite(camp, suite_id)
+def read_aggregate(camp: Path, suite_id: str, *, verified_suites: dict | None = None,
+                   verified_suite: dict | None = None, verified_scores: list[dict] | None = None) -> dict:
+    # Inputs may be reused only inside one native operation with no source writes.
+    # The receipt and score bytes are still bound here; a later caller verifies anew.
+    suite = verified_suite if verified_suite is not None else validate_suite(camp, suite_id)
+    if suite["suite_id"] != suite_id:
+        raise ValueError("method_suite_verified_identity_mismatch")
     target = camp / "suites" / suite_id / "aggregate.json"
     body = read(target)
+    accepted = {row["fold_id"]: row for row in verified_scores or []}
+    scores = []
     for dep in body["score_dependencies"]:
         verify_dependencies([dep])
-        verify_score(camp, suite, read(Path(dep["path"])))
-    computed = aggregate_records(suite, [read(Path(dep["path"])) for dep in body["score_dependencies"]])
+        score = read(Path(dep["path"]))
+        if accepted.get(score["fold_id"]) != score:
+            verify_score(camp, suite, score)
+        scores.append(score)
+    computed = aggregate_records(suite, scores)
     if body["aggregate"] != computed or computed["status"] != "complete":
         raise ValueError("method_suite_aggregate_invalid")
+    if verified_suites is not None:
+        verified_suites[suite_id] = suite
     return computed
 
 
@@ -487,7 +570,8 @@ def verify_score(camp: Path, suite: dict, score: dict) -> None:
 
 
 def verified_suite_records(camp: Path, state: dict, *, target_ids: set[str] | None = None,
-                           evidence_ids: set[str] | None = None) -> list[dict]:
+                           evidence_ids: set[str] | None = None,
+                           verified_results: dict | None = None, verified_suites: dict | None = None) -> list[dict]:
     records = []
     for row in state.get("evidence") or []:
         if row.get("kind") != "method_suite" or row.get("evaluation_valid") is not True:
@@ -496,7 +580,13 @@ def verified_suite_records(camp: Path, state: dict, *, target_ids: set[str] | No
                 or evidence_ids is not None and row.get("evidence_id") not in evidence_ids):
             continue
         try:
-            result = read_aggregate(camp, row["suite_id"])
+            key = ("method_suite", row["suite_id"])
+            result = (verified_results or {}).get(key)
+            if result is None or verified_suites is not None and row["suite_id"] not in verified_suites:
+                result = read_aggregate(camp, row["suite_id"],
+                    **({"verified_suites": verified_suites} if verified_suites is not None else {}))
+                if verified_results is not None:
+                    verified_results[key] = result
             if (result == row["aggregate"] and result["method_revision"] == row["method_revision"]
                     and digest(Path(row["suite_ref"])) == row["result_hash"]):
                 records.append(row)
@@ -516,11 +606,12 @@ def suite_cost_estimates(camp: Path, state: dict, observation: dict) -> dict:
             if common.get("evaluation_schedule") == "screen_then_confirm" and action in {"run_screening", "run_confirmation", "run_full"}:
                 from react_agent.eeg_research.agentic.screening import phase_cost, suites_for_target, valid_scores, SCREENING, CONFIRMATION
                 phase = CONFIRMATION if action == "run_confirmation" else SCREENING
-                c_suites = suites_for_target(camp, target or "baseline")
-                b_suites = suites_for_target(camp, "baseline")
+                c_suites = suites_for_target(camp, target or "baseline", state=state)
+                b_suites = c_suites if (target or "baseline") == "baseline" else suites_for_target(camp, "baseline", state=state)
                 c_done = [row["fold_id"] for row in valid_scores(camp, c_suites[-1])] if c_suites else []
-                b_done = [row["fold_id"] for row in valid_scores(camp, b_suites[-1])] if b_suites else []
-                cost = phase_cost(common, phase, c_done, b_done, target=target or "baseline")
+                b_done = c_done if b_suites is c_suites else [row["fold_id"] for row in valid_scores(camp, b_suites[-1])] if b_suites else []
+                recipe = c_suites[-1]["method"]["hook_spec"].get("training") if c_suites else training_for_target(camp, target or "baseline")
+                cost = phase_cost(common, phase, c_done, b_done, target=target or "baseline", candidate_training=recipe)
                 estimates[f"{action}:{target or ''}"] = {**cost,
                     "estimated_cost": {"llm_calls": None, "training_jobs": cost["training_jobs"], "gpu_seconds": cost["gpu_seconds"]},
                     "cost_basis": ["runtime:phase_missing_candidate_and_baseline_folds", "manifest:" + common["manifest_hash"]],
@@ -531,37 +622,46 @@ def suite_cost_estimates(camp: Path, state: dict, observation: dict) -> dict:
             training = action == "run_full"
             design = action in {"design_experiment", "propose_experiment", "implement_candidate"}
             local = action in {"inspect_data", "retrieve_memory", "collect_diagnostics", "diagnose_results", "revise_report", "stop"}
+            recipe = training_for_target(camp, target or "baseline")
+            estimate = suite_gpu_estimate(common, recipe)
+            epochs = recipe["epochs"] if recipe else common["folds"][0]["protocol"]["full_epochs"]
             estimates[f"{action}:{target or ''}"] = {
                 "estimated_cost": {"llm_calls": 0 if local else None, "training_jobs": 10 if training else 0 if local else None,
-                                   "gpu_seconds": common["gpu_seconds_estimate_per_suite"] if training else 0.0 if local else None},
+                                   "gpu_seconds": estimate if training else 0.0 if local else None},
                 "cost_basis": ["runtime:complete_method_suite:10_full_10_cpu_scores", "manifest:" + common["manifest_hash"]],
                 "cost_confidence": "rough" if training or design else "runtime_bound" if local else "unknown",
                 "cost_scope": "complete_method_suite_pipeline", "components": {
-                    "full_training": {"training_jobs": 10, "epochs_per_fold": 50, "seed": 0},
+                    "full_training": {"training_jobs": 10, "epochs_per_fold": epochs, "seed": 0},
                     "benchmark_scoring": {"folds": 10, "device": "cpu", "gpu_seconds": 0.0},
                     "repair_allowance": {"maximum_repairs_per_candidate": 2, "additional_jobs": "only_if_needed_and_budgeted"}},
                 "full_followup_pipeline_cost": {"training_jobs": 10 if design else 0,
-                    "gpu_seconds": common["gpu_seconds_estimate_per_suite"] if design else 0.0, "llm_calls": None},
+                    "gpu_seconds": estimate if design else 0.0, "llm_calls": None},
                 "unknown_components": [] if local else ["role_retries", "repair_calls", "candidate_runtime_multiplier"],
                 "historical_samples": [], "api_usd": None, "usd_status": "unpriced",
                 "estimates_are_execution_authority": False, "planner_call_already_in_budget_ledger": True}
     return estimates
 
 
-def commit_aggregate(camp: Path, state: dict, suite: dict) -> dict:
+def commit_aggregate(camp: Path, state: dict, suite: dict, *, verified_result: dict | None = None) -> dict:
     directory = camp / "suites" / suite["suite_id"]
-    paths = [directory / fold["fold_id"] / "benchmark.json" for fold in suite["folds"]]
-    result = aggregate_records(suite, [read(path) for path in paths if path.exists()])
-    for score in result["scores"]:
-        verify_score(camp, suite, score)
-    if result["status"] != "complete":
-        raise ValueError("method_suite_not_complete")
-    wrapper = {"aggregate": result, "score_dependencies": [{"path": str(path), "sha256": digest(path)} for path in paths]}
     path = directory / "aggregate.json"
-    if not path.exists():
-        write_once(path, wrapper)
+    if verified_result is not None:
+        result = verified_result
+        if (not path.is_file() or result.get("suite_hash") != suite["suite_hash"]
+                or result.get("candidate_id") != suite["method"]["candidate_id"] or result.get("status") != "complete"):
+            raise ValueError("method_suite_verified_result_identity_mismatch")
     else:
-        read_aggregate(camp, suite["suite_id"])
+        paths = [directory / fold["fold_id"] / "benchmark.json" for fold in suite["folds"]]
+        result = aggregate_records(suite, [read(path) for path in paths if path.exists()])
+        for score in result["scores"]:
+            verify_score(camp, suite, score)
+        if result["status"] != "complete":
+            raise ValueError("method_suite_not_complete")
+        wrapper = {"aggregate": result, "score_dependencies": [{"path": str(path), "sha256": digest(path)} for path in paths]}
+        if not path.exists():
+            write_once(path, wrapper)
+        else:
+            read_aggregate(camp, suite["suite_id"])
     eid = "ev_suite_" + suite["suite_id"]
     existing = next((row for row in state["evidence"] if row.get("evidence_id") == eid), None)
     if existing:
@@ -572,8 +672,13 @@ def commit_aggregate(camp: Path, state: dict, suite: dict) -> dict:
                     and row.get("evaluation_valid") and row.get("seed") == result["seed"]), None)
     comparison = {"comparable": False, "reason": "baseline_reference"}
     if control and result["candidate_id"] != "baseline":
-        baseline = read_aggregate(camp, control["suite_id"])
-        if control["execution_fingerprint"] != state["execution_fingerprint"]:
+        verified_suites = {}
+        baseline = read_aggregate(camp, control["suite_id"], verified_suites=verified_suites)
+        from .execution_protocol import evaluation_comparison_config
+        baseline_suite = verified_suites[control["suite_id"]]
+        if (baseline_suite["manifest_hash"] != suite["manifest_hash"]
+                or evaluation_comparison_config(baseline_suite["method"]["public_recipe"])
+                != evaluation_comparison_config(suite["method"]["public_recipe"])):
             raise ValueError("method_suite_control_recipe_mismatch")
         a = {row["held_out_subject"]: row["metrics"]["top1"] for row in result["scores"]}
         b = {row["held_out_subject"]: row["metrics"]["top1"] for row in baseline["scores"]}
@@ -582,9 +687,11 @@ def commit_aggregate(camp: Path, state: dict, suite: dict) -> dict:
                       "subject_deltas_pp": deltas, "control_run_id": control["evidence_id"], "paired_complete_suites": 1,
                       "independent_seed_count": 1, "replicated": False, "statistical_significance": "not_established"}
         comparison.update(required_fold_count=10, candidate_suite_hash=suite["suite_hash"], control_suite_hash=control["suite_hash"])
+        comparison.update(training_recipe=suite["method"]["public_recipe"],
+                          control_training_recipe=baseline_suite["method"]["public_recipe"], comparison_scope="complete_method")
     goal = read(camp / "goal.json")
     gain = comparison.get("delta_pp")
-    promotion = {"status": "development_improvement" if gain is not None and gain >= float(goal["min_practical_gain_pp"])
+    promotion = {"status": "development_improvement" if gain is not None and meets_gain_threshold(gain, float(goal["min_practical_gain_pp"]))
                  else "development_negative" if gain is not None else "baseline_reference", "replicated": False,
                  "independent_seed_count": 1, "paired_complete_suites": 1 if control else 0,
                  "scope": "method_development_benchmark", "statistical_significance": "not_established"}
@@ -596,6 +703,7 @@ def commit_aggregate(camp: Path, state: dict, suite: dict) -> dict:
            "evaluation_mode": MODE, "metric_scope": "method_development_benchmark", "primary_metric": METRIC,
            "aggregate": result, "evaluation_valid": True, "fidelity": "full", "seed": result["seed"],
            "source_hash": suite["method"]["source_hash"], "spec_hash": suite["method"]["spec_hash"],
+           "training_recipe": suite["method"]["public_recipe"],
            "config_hash": identity(suite["method"]["hook_spec"]), "method_revision": result["method_revision"],
            "execution_fingerprint": state["execution_fingerprint"], "contract_fingerprint": state["contract_fingerprint"],
            "result_hash": digest(path), "fixed_bank_top1": result["mean_top1"], "fixed_bank_top5": result["mean_top5"],
@@ -614,8 +722,9 @@ def commit_aggregate(camp: Path, state: dict, suite: dict) -> dict:
             row["updates_screening_evidence_id"] = screening_row["evidence_id"]
             if gain is not None:
                 threshold = screened.get("min_mean_gain_pp", 0.5)
-                row["screening_update_relation"] = ("contradicts_screening_promotion" if screened["screening_result"] == "screening_passed" and gain < threshold
-                                                    else "overturns_screening_nonpromotion" if screened["screening_result"] != "screening_passed" and gain >= threshold
+                threshold_met = meets_gain_threshold(gain, threshold)
+                row["screening_update_relation"] = ("contradicts_screening_promotion" if screened["screening_result"] == "screening_passed" and not threshold_met
+                                                    else "overturns_screening_nonpromotion" if screened["screening_result"] != "screening_passed" and threshold_met
                                                     else "consistent_at_current_threshold")
         if comparison.get("comparable"):
             comparison["paired_mean_delta_pp"] = comparison["delta_pp"]
@@ -625,6 +734,7 @@ def commit_aggregate(camp: Path, state: dict, suite: dict) -> dict:
                  artifact=str(path), episode_id="ep_" + suite["suite_hash"][:24],
                  job_id=suite["suite_id"] + "::confirmation_10fold" if suite.get("evaluation_schedule") == "screen_then_confirm" else suite["suite_id"])
     ep["scope"] = "method_development_benchmark"
+    ep["training_recipe"] = suite["method"]["public_recipe"]
     if suite.get("evaluation_schedule") == "screen_then_confirm":
         ep.update(science_scope=SCIENCE_SCOPE, selection_manifest_hash=suite["selection_manifest_hash"],
                   method_revision=suite["method"]["method_revision"],
@@ -640,7 +750,8 @@ def commit_aggregate(camp: Path, state: dict, suite: dict) -> dict:
     return row
 
 
-def scientific_feedback_records(camp: Path, state: dict, row: dict) -> dict:
+def scientific_feedback_records(camp: Path, state: dict, row: dict, *,
+                                sources_by_evidence_id: dict | None = None) -> dict:
     """Find completed, source-bound native analysis and curation artifacts."""
     from react_agent.eeg_research.agentic.artifacts import REGISTRY
     from react_agent.eeg_research.agentic.handoffs import development_artifact, method_benchmark_origin, method_screening_origin
@@ -662,7 +773,8 @@ def scientific_feedback_records(camp: Path, state: dict, row: dict) -> dict:
             body = read(Path(artifact["path"]))
             if body.get("status") != "completed" or (body.get("payload") or {}).get(origin_key) != origin:
                 continue
-            verified = development_artifact(camp, artifact["artifact_id"])
+            verified = development_artifact(camp, artifact["artifact_id"],
+                sources_by_evidence_id=sources_by_evidence_id)
         except (OSError, ValueError, KeyError, TypeError):
             continue
         records["analysis" if kind == "analysis" else "curation"] = {
@@ -740,7 +852,9 @@ def _audit_full(camp: Path, state: dict) -> dict:
         path = path.resolve()
         actual = digest(path)
         if sha256 is not None and actual != sha256:
-            raise ValueError("method_audit_dependency_changed:" + str(path))
+            from .historical_runtime import dispatch_patch_matches
+            if not dispatch_patch_matches(camp, path, sha256, actual):
+                raise ValueError("method_audit_dependency_changed:" + str(path))
         prior = dependencies.get(str(path))
         if prior is not None and prior["content_hash"] != actual:
             raise ValueError("method_audit_dependency_changed_during_projection")
@@ -750,6 +864,9 @@ def _audit_full(camp: Path, state: dict) -> dict:
 
     common = manifest(camp)
     add(camp / "method_search_manifest.json", kind="method_search_manifest")
+    from .historical_runtime import dispatch_patch_receipts
+    for receipt_path in dispatch_patch_receipts(camp):
+        add(receipt_path, kind="runtime_dispatch_patch")
     for dep in [*common["framework_dependencies"], *common["data_dependencies"], *common["cache_dependencies"]]:
         add(Path(dep["path"]), sha256=dep["sha256"])
     for row in records:
@@ -801,7 +918,7 @@ def advance(camp: Path, state: dict, services: dict) -> bool:
 def _advance_full(camp: Path, state: dict, services: dict) -> bool:
     """One execution step, with no paid scientific calls until 10/10 complete."""
     from react_agent.eeg_research.agentic import jobs
-    from react_agent.eeg_research.agentic.budget import charge_gpu, release_gpu
+    from react_agent.eeg_research.agentic.budget import charge_gpu
     from react_agent.eeg_research.agentic.execution_protocol import design_from_protocol
     from react_agent.eeg_research.agentic.loop import _write, save_state
     from react_agent.eeg_training.protocol import torch_python
@@ -866,8 +983,6 @@ def _advance_full(camp: Path, state: dict, services: dict) -> bool:
             _write(progress_path, progress)
             save_state(camp, state)
             return True
-        if state["training_jobs"] >= state["max_training_jobs"] or state["gpu_seconds_left"] <= 0:
-            raise ValueError("method_suite_budget_exhausted_partial")
         phased = suite.get("evaluation_schedule") == "screen_then_confirm"
         if phased:
             from react_agent.eeg_research.agentic.screening import before_launch
@@ -880,26 +995,25 @@ def _advance_full(camp: Path, state: dict, services: dict) -> bool:
             raise ValueError("method_fold_physical_gpu_identity_changed")
         job_id = "j" + str(state["training_jobs"] + 1) + "_" + suite_id + "_" + fold_id
         job = camp / "jobs" / job_id
-        # Persist intent first. If an API/worker crash interrupts process
-        # publication, uncertainty blocks a duplicate launch rather than guesses.
+        # Claim the job before publishing launch intent. Once intent exists,
+        # interrupted process publication blocks a duplicate launch.
         intent = {"suite_id": suite_id, "fold_id": fold_id, "protocol_hash": fold["protocol"]["fingerprint"]}
         if phased:
             intent.update(phase=progress["phase"], phase_receipt_id=state["phase_reservation_id"],
                           canonical_fold_hash=fold["canonical_fold_identity"]["canonical_hash"])
-        if not phased:
+        if phased:
+            from react_agent.eeg_research.agentic.budget import consume_phase_job
+            consume_phase_job(camp, state["phase_reservation_id"], job_id)
+        else:
             from .owner_budget import enabled as owner_enabled, claim_training
             if owner_enabled(camp):
-                claim_training(camp,job_id,manifest(camp)["gpu_seconds_estimate_per_suite"] / 10)
+                claim_training(camp, job_id)
         write_once(job / "launch_intent.json", intent)
         progress["jobs"][fold_id] = job_id
         progress["status"] = "running"
         _write(progress_path, progress)
-        if phased:
-            from react_agent.eeg_research.agentic.budget import consume_phase_job
-            consume_phase_job(camp, state["phase_reservation_id"], job_id,
-                              manifest(camp)["gpu_seconds_estimate_per_suite"] / 10)
         state["training_jobs"] += 1
-        state["method_jobs_reserved"] = max(0, int(state.get("method_jobs_reserved", 10)) - 1)
+        state["method_jobs_reserved"] = 0
         state["live_job"] = job_id
         save_state(camp, state)
         target = suite["method"]["candidate_id"]
@@ -920,7 +1034,8 @@ def _advance_full(camp: Path, state: dict, services: dict) -> bool:
     row = commit_aggregate(camp, state, suite)
     progress["status"] = "complete"
     _write(progress_path, progress)
-    release_gpu(state, float(state.pop("method_gpu_reservation", 0)))
+    state.pop("method_gpu_reservation", None)
+    state["gpu_seconds_reserved"] = 0.0
     state.update(active_suite=None, live_job=None, method_jobs_reserved=0, status="analyzing")
     save_state(camp, state)
     complete_scientific_feedback(camp, state, row, services)
@@ -970,11 +1085,6 @@ def retry_fold(camp: Path, state: dict, suite_id: str, fold_id: str, *, reason: 
     refresh_probe_budget(camp, state)
     if len(attempts) >= 2:
         raise ValueError("method_fold_engineering_retry_limit_reached")
-    remaining_folds = 10 - len(progress["completed_folds"])
-    remaining_estimate = manifest(camp)["gpu_seconds_estimate_per_suite"] * remaining_folds / 10
-    if (state["max_training_jobs"] - state["training_jobs"] < remaining_folds
-            or state["gpu_seconds_left"] < remaining_estimate):
-        raise ValueError("method_fold_retry_cannot_reserve_remaining_full_jobs")
     attempts.append({"job_id": job_id, "job_ref": str(camp / "jobs" / job_id / "job.json"),
                      "job_sha256": digest(camp / "jobs" / job_id / "job.json"),
                      "status": record["status"], "gpu_seconds": record.get("gpu_seconds", 0),
@@ -985,9 +1095,9 @@ def retry_fold(camp: Path, state: dict, suite_id: str, fold_id: str, *, reason: 
     _write(path, progress)
     state["live_job"] = None
     state["status"] = "paused"
-    state["method_jobs_reserved"] = remaining_folds
-    state["gpu_seconds_reserved"] = remaining_estimate
-    state["method_gpu_reservation"] = remaining_estimate
+    state["method_jobs_reserved"] = 0
+    state["gpu_seconds_reserved"] = 0.0
+    state.pop("method_gpu_reservation", None)
     event(camp, "method_fold_engineering_retry_queued", suite_id=suite_id, fold_id=fold_id,
           failed_job_id=job_id, engineering_retry=len(attempts), reason=reason.strip())
     return {"status": "engineering_retry_queued", "suite_id": suite_id, "fold_id": fold_id,
@@ -1003,14 +1113,17 @@ def recover(camp: Path, state: dict) -> dict:
     if manifest(camp).get("evaluation_schedule") == "screen_then_confirm":
         from react_agent.eeg_research.agentic.screening import recover as recover_phase
         return recover_phase(camp, state, probes_recovered=True)
+    detached = completed_detached_suites(camp, state)
     for path in sorted((camp / "suites").glob("*/suite_state.json")):
+        if path.parent.name in detached:
+            continue
         progress = read(path)
         suite = validate_suite(camp, path.parent.name)
         if suite["method"]["candidate_id"] in state.get("detached_candidates", []):
             continue
         if (path.parent / "aggregate.json").exists():
-            read_aggregate(camp, path.parent.name)
-            commit_aggregate(camp, state, suite)
+            result = read_aggregate(camp, path.parent.name, verified_suite=suite)
+            commit_aggregate(camp, state, suite, verified_result=result)
         elif progress["status"] in {"pending", "running"}:
             if state.get("active_suite") not in {None, path.parent.name}:
                 raise ValueError("method_multiple_active_suites")
@@ -1022,15 +1135,7 @@ def recover(camp: Path, state: dict) -> dict:
     state["training_jobs"] = max(state["training_jobs"], len(intents | records), int(cost.get("training_jobs", 0)))
     used = float(cost.get("gpu_seconds_used", 0))
     state["gpu_seconds_left"] = float(state["max_gpu_seconds"]) - used
-    if state.get("active_suite"):
-        directory = camp / "suites" / state["active_suite"]
-        progress = read(directory / "suite_state.json")
-        estimate = manifest(camp)["gpu_seconds_estimate_per_suite"]
-        remaining_estimate = estimate * (10 - len(progress["completed_folds"])) / 10
-        state["gpu_seconds_reserved"] = remaining_estimate
-        state["method_gpu_reservation"] = remaining_estimate
-        state["method_jobs_reserved"] = 10 - len(progress["jobs"])
-    else:
-        state["gpu_seconds_reserved"] = 0.0
-        state["method_jobs_reserved"] = 0
+    state["gpu_seconds_reserved"] = 0.0
+    state["method_jobs_reserved"] = 0
+    state.pop("method_gpu_reservation", None)
     return state

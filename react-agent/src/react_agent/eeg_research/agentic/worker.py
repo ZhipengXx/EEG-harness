@@ -7,7 +7,6 @@ import subprocess
 import fcntl
 import json
 import os
-import sqlite3
 import time
 from pathlib import Path
 from typing import Any
@@ -71,6 +70,54 @@ def _run_context_maintenance(camp: Path, state: dict[str, Any], services: dict[s
         # resets the Planner round nor removes its blocked failure.
         _sync_ledger(camp, state)
         save_state(camp, state)
+
+
+def _reconcile_confirmation_control(camp: Path, state: dict, latest: dict) -> None:
+    """Publish the completed matched control before interpreting confirmation.
+
+    Phase recovery can mark the baseline complete from its fold receipts before
+    its aggregate has been published. Reuse native publication to finish that
+    dependency and rebuild the unanalysed comparison, without rerunning folds.
+    """
+    if (latest.get("kind") != "method_suite" or latest.get("phase") != "confirmation_10fold"
+            or latest.get("candidate_id") == "baseline"
+            or (latest.get("comparison") or {}).get("comparable") is True):
+        return
+    evidence_id = latest["evidence_id"]
+    if any(row.get("kind") == "analysis" and row.get("run_evidence_id") == evidence_id
+           and row.get("status") == "completed" for row in state.get("evidence") or []):
+        raise ValueError("confirmation_control_reconciliation_after_analysis")
+    from . import method_suite
+    from .budget import phase_reservation
+
+    progress = json.loads((camp / "suites" / latest["suite_id"] / "suite_state.json").read_text())
+    request = phase_reservation(camp, progress["phase_receipt_id"])["request"]
+    if (request["phase"] != "confirmation_10fold"
+            or request["candidate_suite_id"] != latest["suite_id"]
+            or request["suite_hash"] != latest["suite_hash"]
+            or request["method_revision"] != latest["method_revision"]):
+        raise ValueError("confirmation_control_phase_binding_mismatch")
+    suite = method_suite.validate_suite(camp, latest["suite_id"])
+    baseline = method_suite.validate_suite(camp, request["baseline_suite_id"])
+    if (baseline["method"]["candidate_id"] != "baseline"
+            or baseline["suite_hash"] != request["baseline_suite_hash"]
+            or baseline["seed"] != suite["seed"]):
+        raise ValueError("confirmation_control_suite_binding_mismatch")
+    control = method_suite.commit_aggregate(camp, state, baseline)
+    remaining = [row for row in state["evidence"] if row.get("evidence_id") != evidence_id]
+    # Native comparison selects a same-seed control. Put the receipt's exact
+    # control first in this temporary view, retaining all other history.
+    projection = {**state, "evidence": [control, *[row for row in remaining if row is not control]],
+                  "memory": list(state.get("memory") or [])}
+    rebuilt = method_suite.commit_aggregate(camp, projection, suite)
+    latest.clear()
+    latest.update(rebuilt)
+    state["evidence"] = [*remaining, latest]
+    state["memory"] = projection["memory"]
+    state.update(audit_status=projection["audit_status"], audit_fresh=projection["audit_fresh"])
+    save_state(camp, state)
+    event(camp, "confirmation_control_reconciled", evidence_id=evidence_id,
+          control_evidence_id=control["evidence_id"])
 
 
 def candidate_seed_coverage(latest: dict[str, Any], scientific_rows: list[dict[str, Any]],
@@ -157,6 +204,46 @@ def candidate_seed_coverage(latest: dict[str, Any], scientific_rows: list[dict[s
                 "screening_subjects": body.get("screening_subjects"),
                 "promotion_authority": "separate_native_gate"})
     return result
+
+
+def _analysis_evidence_ids(state: dict, latest: dict, *, parent_id: str | None,
+                           parent_binding: dict | None) -> set[str]:
+    """Select native inputs before expensive verification; selection is not acceptance."""
+    rows = [row for row in state.get("evidence") or []
+            if row.get("kind") in {"method_suite", "method_screening"}
+            and row.get("evaluation_valid") is True]
+    same_revision = [row for row in rows
+        if row.get("candidate_id") == latest.get("candidate_id")
+        and row.get("fidelity") == latest.get("fidelity")
+        and all(row.get(key) == latest.get(key) for key in (
+            "source_hash", "spec_hash", "execution_fingerprint", "method_revision"))
+        and (row.get("kind") == latest.get("kind") or row.get("kind") == "method_suite")]
+    # Keep full-suite observations needed by primary seed coverage even when
+    # this task interprets screening. Other candidates are only explicit pairs.
+    phase_rows = [row for row in same_revision if row.get("kind") == latest.get("kind")]
+    control_ids = {row.get("control_id") or (row.get("comparison") or {}).get("control_run_id")
+                   for row in phase_rows}
+    control_hashes = {((row.get("screening") or {}).get("baseline_suite_hash")
+                       if row.get("kind") == "method_screening" else
+                       (row.get("comparison") or {}).get("control_suite_hash")) for row in phase_rows
+                      if not (row.get("control_id") or (row.get("comparison") or {}).get("control_run_id"))}
+    paired_seeds = {row.get("seed") for row in phase_rows}
+    fingerprint = latest.get("evaluation_comparison_fingerprint") or latest.get("execution_fingerprint")
+    ids = {row["evidence_id"] for row in same_revision}
+    ids.add(latest["evidence_id"])
+    for row in rows:
+        if row.get("kind") != latest.get("kind") or row.get("fidelity") != latest.get("fidelity"):
+            continue
+        if row.get("candidate_id") == "baseline" and (
+                row.get("evidence_id") in control_ids or row.get("suite_hash") in control_hashes - {None}):
+            ids.add(row["evidence_id"])
+        elif (parent_binding and row.get("candidate_id") == parent_id and row.get("seed") in paired_seeds
+              and row.get("source_hash") == parent_binding.get("source_hash")
+              and row.get("spec_hash") == parent_binding.get("spec_hash")
+              and (row.get("evaluation_comparison_fingerprint") or row.get("execution_fingerprint")) == fingerprint):
+            ids.add(row["evidence_id"])
+    return ids
+
 
 _METHOD_ROLE_HARD_BLOCKS = {
     "role_no_progress_retry_limit", "unsettled_api_intent_requires_recovery",
@@ -583,7 +670,15 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
             if critic_context is not None:
                 return client(payload, critic_context=critic_context)
             return client(payload)
+        def record_validation(operation_id, reply, result):
+            publish = getattr(client, "record_validation", None)
+            if callable(publish):
+                publish(operation_id, reply, result)
+            else:
+                from .llm import record_role_validation
+                record_role_validation(camp, operation_id, reply, result)
         call.bind = bind
+        call.record_validation = record_validation
         return call
 
     analyst = lazy_backend("result_analyst")
@@ -610,6 +705,32 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
 
     def settle(camp_dir: Path, job_id: str) -> dict[str, Any]:
         return jobs.reconcile(camp_dir / "jobs" / job_id)
+
+    def completed_implementation(camp_dir: Path, state: dict[str, Any], plan: dict) -> bool:
+        """Adopt accepted implementation receipts when an older step is still pending."""
+        from .semantic_memory import read_json
+        from .run_context import intervention_config_hash
+        from .binding import file_sha256
+        candidate_id = plan.get("candidate_id")
+        row = next((item for item in state.get("candidates") or [] if item.get("candidate_id") == candidate_id), {})
+        if not (state.get("candidate_ready") and state.get("candidate_id") == candidate_id
+                and row.get("status") == "ready" and row.get("review_operation_id")):
+            return False
+        workspace = camp_dir / "candidates" / candidate_id
+        experiment = (read_json(workspace / "spec.json").get("experiment") or {})
+        if experiment.get("spec_hash") != plan.get("spec_hash"):
+            return False
+        attempt = read_json(workspace / "attempt.json")
+        design_v2 = experiment.get("design_contract_version") == "v2"
+        if not _checked_repair_implementation(workspace, read_json(workspace / "implementation.json"),
+                candidate_id=candidate_id, attempt_id=attempt.get("attempt_id"), design_v2=design_v2):
+            return False
+        mapping = workspace / "implementation_map.json"
+        review = _stored_review(workspace, candidate_id=candidate_id, attempt_id=attempt.get("attempt_id"),
+            input_hash=source_hash(workspace), **({"approved_spec_hash": plan.get("spec_hash"),
+                "intervention_config_hash": intervention_config_hash(experiment),
+                "implementation_map_hash": file_sha256(mapping) if mapping.is_file() else ""} if design_v2 else {}))
+        return bool(review and review.get("status") == "ready" and review.get("operation_id") == row["review_operation_id"])
 
     def do_implement(camp_dir: Path, state: dict[str, Any], *,
                      review_candidate_id: str | None = None,
@@ -653,7 +774,11 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
             _block_phase(camp_dir, state, phase="implement_candidate",
                          error_type=exc.reason, detail=exc.reason, recoverable=True)
             return
-        coder = role_backend(camp, "candidate_coder") if review_operation is None else None
+        evidence_id = f"ev_impl_{candidate_id}"
+        awaiting_check = (state.get("pending_candidate_check") or {}).get("candidate_id") == candidate_id
+        if not repairing and not awaiting_check and review_reason is None and any(row.get("evidence_id") == evidence_id for row in state.get("evidence") or []):
+            return
+        coder = None
         reviewer = role_backend(camp, "candidate_reviewer")
         spec = {"hypothesis": assigned.get("hypothesis"), "experiment": assigned}
         design_v2 = assigned.get("design_contract_version") == "v2"
@@ -663,7 +788,6 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
             spec["current_user_instruction"] = current_user_instruction
         from react_agent.eeg_research.agentic.semantic_memory import read_json
         previous_spec = read_json(workspace / "spec.json")
-        previous_attempt_id = read_json(workspace / "attempt.json").get("attempt_id")
         from react_agent.eeg_research.agentic.audit_context import audit_feedback
         from react_agent.eeg_research.agentic.handoffs import selected_read_context
         spec["audit_issues"] = [row for row in audit_feedback(camp_dir, state)["issues"]
@@ -684,14 +808,14 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
                 spec["review_focus"] = repair.get("review_focus") or {"issues": repair.get("issues") or []}
                 spec["review_focus"]["previous_review"] = repair.get("previous_review")
         workspace.mkdir(parents=True, exist_ok=True)
-        from react_agent.eeg_research.agentic.run_context import load_approved_binding, persist_approved_binding
+        from react_agent.eeg_research.agentic.run_context import load_approved_binding, persist_approved_binding, resolve_execution_protocol
         from react_agent.eeg_research.agentic.experiment_gate import experiment_is_approved
         if load_approved_binding(camp_dir, candidate_id) is None and experiment_is_approved(assigned):
             persist_approved_binding(camp_dir, candidate_id, assigned,
                 spec_ref=assigned.get("experiment_ref") or state.get("experiment_ref"))
         if review_operation is None:
             (workspace / "spec.json").write_text(json.dumps(spec, ensure_ascii=False, indent=2), encoding="utf-8")
-        protocol = load_protocol(camp_dir)
+        protocol = resolve_execution_protocol(camp_dir, candidate_id, load_protocol(camp_dir) or {})
         interface = candidate_interface(protocol)
         if design_v2:
             interface["design_contract_version"] = "v2"
@@ -700,9 +824,13 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
                 json.dumps(interface, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+        inherited = None
         try:
             if review_operation is None:
                 materialize(camp_dir, workspace, assigned)
+                if not repairing and not spec.get("audit_issues") and not spec.get("artifact_reads") and not (workspace / "coder_log.jsonl").is_file():
+                    from .lineage import inherited_source
+                    inherited = inherited_source(workspace, assigned)
         except LineageError as exc:
             _block_phase(
                 camp_dir,
@@ -713,10 +841,8 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
                 recoverable=False,
             )
             return
-        evidence_id = f"ev_impl_{candidate_id}"
-        awaiting_check = (state.get("pending_candidate_check") or {}).get("candidate_id") == candidate_id
-        if not repairing and not awaiting_check and review_reason is None and any(row.get("evidence_id") == evidence_id for row in state.get("evidence") or []):
-            return
+        if review_operation is None and inherited is None:
+            coder = role_backend(camp, "candidate_coder")
         max_calls = int(state.get("max_llm_calls", 100))
 
         def calls_left() -> int:
@@ -752,20 +878,8 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
                 save_state(camp_dir, state)
         else:
             attempt = ensure_attempt(workspace, candidate_id)
-        from react_agent.eeg_research.agentic.semantic_memory import coder_delivery
-        try:
-            memory = (coder_delivery(camp_dir, workspace, attempt["attempt_id"], spec, state=state,
-                                    previous_spec=previous_spec, previous_attempt_id=previous_attempt_id)
-                      if review_operation is None else None)
-        except (OSError, ValueError, sqlite3.Error) as exc:
-            _block_phase(camp_dir, state, phase="implement_candidate", error_type="MemorySnapshotError",
-                         detail=f"{type(exc).__name__}: {exc}", recoverable=True)
-            return
-        if memory is not None:
-            spec["retrieved_memory"] = memory
-            (workspace / "spec.json").write_text(json.dumps(spec, ensure_ascii=False, indent=2), encoding="utf-8")
         from react_agent.eeg_research.agentic.artifacts import request_digest
-        if review_operation is None:
+        if coder is not None:
             _attach(
                 coder,
                 candidate_id=candidate_id,
@@ -774,7 +888,7 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
                 operation_id=operation_id(workspace, candidate_id, "implement_candidate"),
                 input_hash=source_hash(workspace),
                 **({"input_digest": request_digest(request=spec)}
-                   if spec.get("artifact_reads") or spec.get("audit_issues") or spec.get("retrieved_memory")
+                   if spec.get("artifact_reads") or spec.get("audit_issues")
                    or spec.get("current_user_instruction") else {}),
             )
         outcome: dict[str, Any] | None = None
@@ -796,15 +910,19 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
             last_llm: LlmUnavailable | None = None
             for _attempt in range(1 if modern_recovery else IMPLEMENT_ATTEMPTS):
                 try:
-                    outcome = implement(
-                        workspace,
-                        spec,
-                        coder,
-                        max_steps=CODER_STEPS,
-                        calls_left=calls_left,
-                        reserve=2,
-                        resume_repair=repairing,
-                    )
+                    if inherited is not None:
+                        from .native_patch import implement_inherited
+                        outcome = implement_inherited(workspace, inherited)
+                    else:
+                        outcome = implement(
+                            workspace,
+                            spec,
+                            coder,
+                            max_steps=CODER_STEPS,
+                            calls_left=calls_left,
+                            reserve=2,
+                            resume_repair=repairing,
+                        )
                     break
                 except RecoveryBlocked as exc:
                     _block_phase(
@@ -1154,12 +1272,14 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
 
     def _analyze_run(camp_dir: Path, state: dict[str, Any], latest: dict[str, Any], *,
                      trigger: dict[str, Any], prepare_only: bool = False,
-                     revalidation_reason: str | None = None) -> dict | None:
+                     revalidation_reason: str | None = None,
+                     selected_task: dict | None = None, diagnostic: dict | None = None) -> dict | None:
         curation_result = None
-        comparison = latest.get("comparison")
-        diagnostics = latest.get("diagnostics")
         if not latest.get("evaluation_valid"):
             return
+        _reconcile_confirmation_control(camp_dir, state, latest)
+        comparison = latest.get("comparison")
+        diagnostics = latest.get("diagnostics")
         from react_agent.eeg_research.agentic.development_feedback import ensure_development_feedback
         method_mode = state.get("evaluation_mode") == "loso_method_search"
         screening_mode = method_mode and latest.get("kind") == "method_screening"
@@ -1168,19 +1288,55 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
         task_protocol = single_plan_enabled(feedback_goal)
         scientific_analysis = task_protocol
         optional_curation = task_protocol or (method_mode and feedback_goal.get("evaluation_schedule") == "screen_then_confirm")
+        from react_agent.eeg_research.agentic.handoffs import analysis_experiment_binding
+        verified_results, verified_suites = {}, {}
+        if method_mode:
+            from .method_suite import verified_suite_records
+            from .screening import verified_screening_records
+            verify_current = verified_screening_records if screening_mode else verified_suite_records
+            current = verify_current(camp_dir, state, evidence_ids={latest["evidence_id"]},
+                verified_results=verified_results, verified_suites=verified_suites)
+            if latest not in current:
+                return
+            suite_result = verified_results[(latest["kind"], latest["suite_id"])]
+            binding = analysis_experiment_binding(camp_dir, latest,
+                verified_result=suite_result, verified_suite=verified_suites.get(latest["suite_id"]))
+        else:
+            binding = analysis_experiment_binding(camp_dir, latest)
+        parent_experiment = binding.get("experiment") or {}
+        parent_id = parent_experiment.get("ablation_of_candidate_id") or parent_experiment.get("parent_candidate_id")
+        # Scientific analysis uses explicitly selected historical observations.
+        # Their saved native facts do not require reopening the parent's runs.
+        if parent_id == "baseline" or scientific_analysis:
+            parent_id = None
+        parent_binding = None
+        if parent_id:
+            from react_agent.eeg_research.agentic.run_context import load_approved_binding
+            parent_binding = load_approved_binding(camp_dir, str(parent_id)) or {}
         scientific_rows = state.get("evidence") or []
         if method_mode:
-            from react_agent.eeg_research.agentic.method_suite import read_aggregate, verified_suite_records
-            scientific_rows = verified_suite_records(camp_dir, state)
+            from react_agent.eeg_research.agentic.method_suite import verified_suite_records
+            evidence_ids = _analysis_evidence_ids(state, latest,
+                parent_id=parent_id, parent_binding=parent_binding)
+            scientific_rows = verified_suite_records(camp_dir, state, evidence_ids=evidence_ids,
+                verified_results=verified_results, verified_suites=verified_suites)
             if screening_mode:
-                from react_agent.eeg_research.agentic.screening import read_screening, verified_screening_records
-                scientific_rows += verified_screening_records(camp_dir, state)
+                from react_agent.eeg_research.agentic.screening import verified_screening_records
+                scientific_rows += verified_screening_records(camp_dir, state, evidence_ids=evidence_ids,
+                    verified_results=verified_results, verified_suites=verified_suites)
             # Raw fold/partial rows cannot grant benchmark interpretation or
             # become controls, even if they carry a truthy evaluation label.
             if latest not in scientific_rows:
                 return
-            suite_result = (read_screening(camp_dir, latest["suite_id"]) if screening_mode else
-                            read_aggregate(camp_dir, latest["suite_id"]))
+            # Keep the current result returned by the first native read.
+            # Binding, Measurement and collection all consume that same snapshot.
+            if prepare_only or revalidation_reason:
+                from react_agent.eeg_research.agentic.method_suite import scientific_feedback_records
+                completed = scientific_feedback_records(camp_dir, state, latest,
+                    sources_by_evidence_id={row["evidence_id"]: row for row in scientific_rows})
+                if "analysis" not in completed:
+                    operation = "handoff_preparation" if prepare_only else "feedback_revalidation"
+                    raise ValueError(operation + "_requires_completed_native_analysis")
             feedback = {"status": "verified_two_fold_screening" if screening_mode else "verified_complete_method_suite",
                         "scope": "two_fold_development" if screening_mode else "method_development_benchmark",
                         "suite_ref": latest["suite_ref"], "suite_hash": latest["suite_hash"],
@@ -1218,13 +1374,15 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
                      and row.get("execution_fingerprint") == latest.get("execution_fingerprint"))
             ],
         }
-        if task_protocol:
-            from .selected_plan import load_plan
-            selected = load_plan(camp_dir, state)
-            if selected:
-                payload["selected_research_task"] = {"plan_id": selected["plan_id"],
-                    **{key: selected["proposal"][key] for key in ("question", "scientific_intent", "evaluation_scope",
-                        "expected_observation", "completion_condition")}}
+        selected = selected_task if trigger.get("kind") == "selected_task_measurement" else None
+        if selected:
+            payload["selected_research_task"] = {"plan_id": selected["plan_id"],
+                **{key: selected["proposal"][key] for key in ("question", "scientific_intent", "evaluation_scope",
+                    "expected_observation", "completion_condition", "task_kind", "task_description")
+                    if key in selected["proposal"]}}
+            comparison_ids = selected["proposal"].get("comparison_observation_ids") or []
+            if comparison_ids:
+                payload["selected_research_task"]["comparison_observation_ids"] = list(comparison_ids)
         from react_agent.eeg_research.agentic.artifacts import request_digest, resolve_verified_artifact
         from react_agent.eeg_research.agentic.handoffs import development_view, load_analysis_views
         from react_agent.eeg_research.agentic.roles import begin_role_task, finish_role_task
@@ -1236,7 +1394,18 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
         if not scientific_analysis:
             payload["candidate_context"] = candidate_context(camp_dir, str(latest["candidate_id"]))
         from react_agent.eeg_research.agentic.measurement_context import evaluation_population_context
-        payload["evaluation_population"] = evaluation_population_context(load_protocol(camp_dir))
+        protocol = load_protocol(camp_dir)
+        payload["evaluation_population"] = evaluation_population_context(protocol)
+        from .analysis_contract import protocol_scientific_conditions
+        if method_mode:
+            measured_folds = {score["fold_id"] for score in suite_result.get("scores") or []}
+            recorded_conditions = [protocol_scientific_conditions(fold["protocol"])
+                for fold in verified_suites[latest["suite_id"]].get("folds") or [] if fold["fold_id"] in measured_folds]
+            payload["scientific_conditions"] = {key: value for key, value in
+                (recorded_conditions[0] if recorded_conditions else {}).items()
+                if all(row.get(key) == value for row in recorded_conditions)}
+        else:
+            payload["scientific_conditions"] = protocol_scientific_conditions(protocol or {})
         from react_agent.eeg_research.agentic.handoffs import verified_encoder_structural_facts
         payload["verified_encoder_structural_facts"] = ([] if scientific_analysis else
             verified_encoder_structural_facts(camp_dir, state, target_ids={str(latest["candidate_id"])}))
@@ -1251,18 +1420,37 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
         payload["objective_semantic_findings"] = objective_semantic_findings(camp_dir,state,
             str(latest["candidate_id"]),str(latest.get("source_hash")),str(latest.get("spec_hash")))
         payload["is_frozen_baseline"] = latest["candidate_id"] == "baseline"
-        from react_agent.eeg_research.agentic.handoffs import analysis_experiment_binding
         from react_agent.eeg_research.agentic.research_progress import verified_diagnostic_facts
-        binding = analysis_experiment_binding(camp_dir, latest)
         payload["hypothesis_binding"] = binding
         if not payload["is_frozen_baseline"]:
             payload["hypothesis"] = binding.get("hypothesis")
             payload["experiment"] = binding.get("experiment")
             payload["hypothesis_binding_missing"] = binding.get("status") != "verified"
         from .stage_contract import has_stage_contract
-        stage_experiment = binding.get("experiment") or bound_experiment or {}
-        if not stage_experiment and (state.get("experiment") or {}).get("spec_hash") == latest.get("spec_hash"):
+        stage_experiment = {} if payload["is_frozen_baseline"] else binding.get("experiment") or bound_experiment or {}
+        if (not payload["is_frozen_baseline"] and not stage_experiment
+                and (state.get("experiment") or {}).get("spec_hash") == latest.get("spec_hash")):
             stage_experiment = state["experiment"]
+        if task_protocol and selected and payload["is_frozen_baseline"]:
+            from .stage_contract import baseline_experiment_for_task
+            native_identity = latest
+            if method_mode:
+                # Reuse the native reader's accepted object; suite manifests can
+                # contain large fold protocols and must not be parsed again here.
+                suite = verified_suites[latest["suite_id"]]
+                if (suite["suite_hash"] != latest["suite_hash"]
+                        or suite["method"]["method_revision"] != latest["method_revision"]):
+                    raise ValueError("baseline_analysis_suite_identity_mismatch")
+                native_identity = suite["method"]
+            stage_experiment = baseline_experiment_for_task(selected["proposal"], latest,
+                native_identity=native_identity, verified_result=suite_result if method_mode else None)
+            payload["hypothesis"] = stage_experiment["hypothesis"]
+        elif task_protocol:
+            from .stage_contract import analysis_experiment_for_task
+            stage_experiment = analysis_experiment_for_task(
+                stage_experiment, selected["proposal"] if selected else None,
+                latest, suite_result if method_mode else {})
+            payload["hypothesis"] = stage_experiment.get("hypothesis", payload.get("hypothesis"))
         measurement_review = None
         from .design_contract import design_contract_version
         if (trigger.get("kind") == "selected_task_measurement" and design_contract_version(feedback_goal) == "v2"
@@ -1290,22 +1478,16 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
                  and row.get("method_revision") == latest.get("method_revision"))]
         # Repeated runs of the same actual seed are not independent seeds.
         same_revision = list({row.get("seed"):row for row in same_revision}.values())
-        control_ids = {row.get("control_id") for row in same_revision if row.get("control_id")}
+        control_ids = {row.get("control_id") or (row.get("comparison") or {}).get("control_run_id")
+                       for row in same_revision}
         baseline_suite_hashes = {(row.get("screening") or {}).get("baseline_suite_hash") for row in same_revision}
-        parent_experiment = binding.get("experiment") or {}
-        parent_id = parent_experiment.get("ablation_of_candidate_id") or parent_experiment.get("parent_candidate_id")
-        if parent_id == "baseline":
-            parent_id = None
-        parent_binding = None
-        if parent_id:
-            from react_agent.eeg_research.agentic.run_context import load_approved_binding
-            parent_binding = load_approved_binding(camp_dir, str(parent_id)) or {}
         paired_seeds = {row.get("seed") for row in same_revision}
         matched = list(same_revision)
+        comparison_fingerprint = latest.get("evaluation_comparison_fingerprint") or latest.get("execution_fingerprint")
         for row in scientific_rows:
             if row.get("evaluation_valid") is not True or row.get("fidelity") != latest["fidelity"]:
                 continue
-            if row.get("execution_fingerprint") != latest.get("execution_fingerprint"):
+            if (row.get("evaluation_comparison_fingerprint") or row.get("execution_fingerprint")) != comparison_fingerprint:
                 continue
             if method_mode and row.get("kind") != latest.get("kind"):
                 continue
@@ -1408,8 +1590,23 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
             if scientific_analysis:
                 from .analysis_context import collect_analysis_evidence
                 try:
+                    verified_control = None
+                    if method_mode and not screening_mode and latest.get("candidate_id") != "baseline":
+                        pair = latest.get("comparison") or {}
+                        control_id = latest.get("control_id") or pair.get("control_run_id")
+                        control_hash = pair.get("control_suite_hash")
+                        verified_control = next((row for row in scientific_rows
+                            if row.get("kind") == "method_suite" and row.get("candidate_id") == "baseline"
+                            and (row.get("evidence_id") == control_id if control_id else
+                                 control_hash and row.get("suite_hash") == control_hash)), None)
+                        if verified_control is None and (control_id or control_hash or pair.get("comparable")):
+                            raise ValueError("analysis_matched_control_unavailable")
                     payload["analysis_evidence"] = collect_analysis_evidence(camp_dir, state, latest,
-                        verified_result=suite_result if method_mode else None)
+                        verified_result=suite_result if method_mode else None,
+                        verified_control=verified_control,
+                        **({"diagnostic": diagnostic} if diagnostic is not None else {}),
+                        **({"comparison_observation_ids": payload["selected_research_task"]["comparison_observation_ids"]}
+                           if (payload.get("selected_research_task") or {}).get("comparison_observation_ids") else {}))
                     collected = payload["analysis_evidence"]
                     for kind in ("objective_semantic_findings", "objective_effectiveness_findings"):
                         for finding in payload.get(kind) or []:
@@ -1426,8 +1623,16 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
                     _sync_ledger(camp_dir, state)
                     return
             from .stage_reviews import analysis_stage_payload
+            if diagnostic is not None:
+                payload["scientific_unit"] = "diagnostic_of_existing_method"
             payload = analysis_stage_payload(payload, stage_experiment, measurement_review)
         payload = development_view(payload)
+        origin_plan_id = (trigger.get("origin_plan_id")
+                          if trigger.get("kind") == "selected_task_measurement" else None)
+        if origin_plan_id:
+            # Local task/cache identity only; the Analyst science projection
+            # omits this field from its API input.
+            payload["origin_plan_id"] = origin_plan_id
         digest = request_digest(request=payload)
         for row in state.get("evidence") or []:
             if row.get("kind") == "analysis" and row.get("run_evidence_id") == latest["evidence_id"] and row.get("analysis_input_digest") == digest:
@@ -1440,7 +1645,9 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
                     if not method_mode:
                         return
                     from react_agent.eeg_research.agentic.method_suite import scientific_feedback_records
-                    if not prepare_only and not revalidation_reason and "curation" in scientific_feedback_records(camp_dir, state, latest):
+                    if not prepare_only and not revalidation_reason and "curation" in scientific_feedback_records(
+                            camp_dir, state, latest, sources_by_evidence_id={
+                                item["evidence_id"]: item for item in scientific_rows}):
                         return
                     # Native begin-task reuses this completed Analyst envelope.
                     # Continue its missing curator stage without new transport.
@@ -1497,6 +1704,7 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
             benchmark_origin = ({"method_screening_origin": method_screening_origin(latest)} if screening_mode else
                                 {"method_benchmark_origin": method_benchmark_origin(latest)})
         envelope = finish_role_task(camp_dir, task, {**reply, "status": role_status,
+            **({"origin_plan_id": origin_plan_id} if origin_plan_id else {}),
             "prompt_hash": raw_reply.get("prompt_hash", "") if "raw_reply" in locals() else "", **benchmark_origin},
             kind="analysis", path=target, candidate_id=latest.get("candidate_id"))
         if staged:
@@ -1505,6 +1713,7 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
             if role_status != "completed":
                 analysis_review["status"] = "blocked"
             analysis_review = save_analysis_review(camp_dir, analysis_review, artifact_id=envelope["artifact_refs"][-1])
+        memory_view = analysis_memory_view(reply) if staged else reply
         analysis_row = {
                 "evidence_id": f"ev_analysis_{task['task_id']}",
                 "kind": "analysis",
@@ -1513,7 +1722,9 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
                 "analysis_input_digest": digest,
                 "analysis_artifact_id": envelope["artifact_refs"][-1],
                 "status": role_status,
-                "summary": ({key: analysis_memory_view(reply)[key] for key in ("hypothesis_assessment", "summary_zh", "next_steps")}
+                **({"diagnostic_evidence_id": diagnostic["evidence_id"]} if diagnostic is not None else {}),
+                **({"origin_plan_id": origin_plan_id} if origin_plan_id else {}),
+                "summary": ({key: memory_view[key] for key in ("hypothesis_assessment", "summary_zh", "next_steps")}
                             if staged else {key: reply.get(key) for key in ("hypothesis_assessment", "summary_zh", "suggested_next_actions")}),
             }
         if measurement_review is not None:
@@ -1702,30 +1913,27 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
             raise LlmUnavailable("external_api_disabled_by_operator")
         scientific_rows = state.get("evidence") or []
         if state.get("evaluation_mode") == "loso_method_search":
-            from react_agent.eeg_research.agentic.method_suite import verified_suite_records
-            scientific_rows = verified_suite_records(camp_dir, state)
-            from react_agent.eeg_research.agentic.screening import verified_screening_records
-            scientific_rows += verified_screening_records(camp_dir, state)
-            by_id = {row["evidence_id"]: row for row in scientific_rows}
-            scientific_rows = [by_id[row["evidence_id"]] for row in state.get("evidence") or []
-                               if row.get("evidence_id") in by_id]
+            # Locate the intended measurement from metadata. _analyze_run owns
+            # native acceptance, including its actual controls and seed support.
+            scientific_rows = [row for row in scientific_rows
+                if row.get("kind") in {"method_suite", "method_screening"}
+                and row.get("evaluation_valid") is True]
         latest = next((row for row in reversed(scientific_rows)
                        if row.get("fidelity") and row.get("candidate_id") and "evaluation_valid" in row), None)
         if latest is None:
             return
         from .research_execution import single_plan_enabled
         if single_plan_enabled(camp_dir):
-            from .selected_plan import load_plan
+            from .selected_plan import _measurement, load_plan
             selected = load_plan(camp_dir, state)
             if not selected:
                 return
-            latest = next((row for row in reversed(scientific_rows)
-                if row.get("candidate_id") == selected.get("candidate_id") and row.get("fidelity")
-                and row.get("evaluation_valid") is True), None)
+            latest = _measurement({**state, "evidence": scientific_rows}, selected)
             if latest is None:
                 return
             _analyze_run(camp_dir, state, latest, trigger={"kind": "selected_task_measurement",
-                "origin_plan_id": selected["plan_id"], "upstream_evidence_id": latest["evidence_id"]})
+                "origin_plan_id": selected["plan_id"], "upstream_evidence_id": latest["evidence_id"]},
+                selected_task=selected)
             return
         if latest.get("kind") == "method_screening":
             _analyze_run(camp_dir, state, latest, trigger={"kind": "completed_screening",
@@ -1738,13 +1946,23 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
             _analyze_run(camp_dir, state, row, trigger=trigger)
 
     def analyze_diagnostics(camp_dir: Path, state: dict[str, Any], diagnostic: dict | None = None) -> None:
-        """Deliver a newly verified report through the existing Analyst gate.
-
-        The same source-bound diagnostic produces the same input digest and
-        native task, so restart or cached collection does not create a new paid
-        analysis. The caller invokes this only after committing new information.
-        """
-        analyze(camp_dir, state)
+        """Analyze the selected diagnostic together with its existing method result."""
+        from .selected_plan import _measurement, load_plan
+        selected = load_plan(camp_dir, state)
+        if not selected or not diagnostic:
+            return
+        evidence_id = diagnostic.get("evidence_id") or diagnostic.get("same_as")
+        # The controller passes a status summary; evidence owns the artifact refs.
+        diagnostic = next((row for row in reversed(state.get("evidence") or [])
+                           if evidence_id and row.get("evidence_id") == evidence_id), None)
+        if diagnostic is None:
+            raise ValueError("analysis_diagnostic_evidence_missing")
+        latest = _measurement(state, selected)
+        if latest is None:
+            return
+        _analyze_run(camp_dir, state, latest, trigger={"kind": "selected_task_measurement",
+            "origin_plan_id": selected["plan_id"], "upstream_evidence_id": latest["evidence_id"]},
+            selected_task=selected, diagnostic=diagnostic)
 
     def _lazy(role: str):
         def call(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1753,13 +1971,11 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
         return call
 
     def prepare_handoff(camp_dir: Path, state: dict[str, Any]) -> dict:
-        from react_agent.eeg_research.agentic.method_suite import (
-            verified_suite_records, scientific_feedback_records,
-        )
         if state.get("evaluation_mode") != "loso_method_search" or state.get("live_job"):
             raise ValueError("handoff_preparation_requires_quiescent_method_campaign")
-        rows = verified_suite_records(camp_dir, state)
-        if not rows or "analysis" not in scientific_feedback_records(camp_dir, state, rows[-1]):
+        rows = [row for row in state.get("evidence") or []
+                if row.get("kind") == "method_suite" and row.get("evaluation_valid") is True]
+        if not rows:
             raise ValueError("handoff_preparation_requires_completed_native_analysis")
         latest = rows[-1]
         result = _analyze_run(camp_dir, state, latest, prepare_only=True,
@@ -1794,12 +2010,12 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
         return result
 
     def revalidate_feedback(camp_dir: Path, state: dict[str, Any], *, reason: str) -> dict:
-        from react_agent.eeg_research.agentic.method_suite import verified_suite_records, scientific_feedback_records
         if (state.get("evaluation_mode") != "loso_method_search" or state.get("live_job")
                 or state.get("active_suite") or not reason.strip()):
             raise ValueError("feedback_revalidation_requires_quiescent_method_campaign_and_reason")
-        rows = verified_suite_records(camp_dir, state)
-        if not rows or "analysis" not in scientific_feedback_records(camp_dir, state, rows[-1]):
+        rows = [row for row in state.get("evidence") or []
+                if row.get("kind") == "method_suite" and row.get("evaluation_valid") is True]
+        if not rows:
             raise ValueError("feedback_revalidation_requires_completed_native_analysis")
         latest = rows[-1]
         result = _analyze_run(camp_dir, state, latest, revalidation_reason=reason,
@@ -1865,6 +2081,7 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
         "critic": lazy_backend("research_critic"),
         "settle": settle,
         "implement": do_implement,
+        "completed_implementation": completed_implementation,
         "resume_pending_check": resume_pending_check,
         "analyze": analyze,
         "analyze_diagnostics": analyze_diagnostics,
@@ -1905,8 +2122,8 @@ def _run_locked_worker(camp: Path, *, poll_seconds: float, max_ticks: int) -> di
             if state.get("status") not in {"paused", "cancelled"}:
                 save_state(camp, state)
             return state
-        align_interrupt(camp)
-    state = load_state(camp)
+        if state.get("status") in _TERMINAL:
+            state = align_interrupt(camp)
     if state.get("status") in _TERMINAL:
         if _context_maintenance_boundary(state):
             with verification_scope():

@@ -1,13 +1,12 @@
 """Designer science delivery and its separate native assembly inputs.
 
 No retrieval, summarization, model call or text clipping happens here. Native
-tasks retain the full context; this projection is only the provider delivery.
+assembly inputs stay local; this projection is only the provider delivery.
 """
 from __future__ import annotations
 
 import copy
 import json
-import math
 from typing import Any
 
 from .context.representations import deduplicate, resolve_request_pointer
@@ -17,23 +16,17 @@ VERSION = "designer_scientific_input.v1"
 
 # One evidence boundary shared by projection consumers and reply validation.
 # Examples and previous answers are formatting aids, never new source evidence.
-DESIGNER_MATERIAL_FIELDS = ("parent_source", "control_source", "selection_basis",
-    "method_evidence", "method_evidence_packet", "retrieved_memory", "retrieved_knowledge",
-    "analyses", "diagnostics", "verified_development_facts", "verified_encoder_structural_facts",
-    "measured_parameter_counts", "parameter_count_comparisons", "method_suite", "method_screening")
+DESIGNER_MATERIAL_FIELDS = ("parent_source", "artifact_reads", "measured_parameter_counts")
 
-_GOAL = ("objective", "task_type", "dataset", "research_scope", "evaluation_mode",
-    "evaluation_schedule", "primary_metric", "direction", "allowed_changes",
-    "frozen_components", "training_seeds", "checkpoint_policy", "subject_aggregation",
-    "required_fold_count", "min_practical_gain_pp", "selection_min_delta",
-    "benchmark_subjects", "benchmark_feedback_enabled", "final_test_enabled")
+_GOAL = ("task_type", "dataset", "research_scope", "evaluation_mode", "allowed_changes",
+    "frozen_components", "checkpoint_policy", "selection_min_delta", "primary_metric")
 _INTERFACE = ("input", "output", "dataset", "c_num", "channels", "timesteps", "gallery_size",
     "build_encoder", "build_training_objective", "build_training_transform", "fit_statistics",
-    "not_available", "runtime_guarantees")
+    "not_available", "runtime_guarantees", "training_configuration")
 _TASK = ("task_kind", "question", "task_description", "scientific_intent", "evaluation_scope",
-    "expected_observation", "completion_condition", "target_candidate_ref")
+    "expected_observation", "completion_condition", "target_candidate_ref", "parent_ref", "comparison_targets")
 _SOURCE = ("candidate_id", "intervention", "hypothesis", "source", "source_ref", "source_range",
-    "source_truncated", "missing_inputs", "model", "objective", "transform", "recipe",
+    "source_truncated", "missing_inputs", "model", "objective", "transform", "training", "recipe",
     "frozen_training_policy", "negative_sampling_policy", "scope", "visibility")
 _LOCAL = {"schema_version", "approval_record", "cpu_check_receipt", "verification_artifact",
     "context_delivery", "context_authority", "working_snapshot", "checks", "check",
@@ -41,7 +34,7 @@ _LOCAL = {"schema_version", "approval_record", "cpu_check_receipt", "verificatio
     "read_unit", "json_pointer", "satisfies_development_read_receipt", "task_id", "attempt_id",
     "origin_plan_id", "plan_id", "campaign_id", "input_digest", "input_hash", "role_models",
     "fingerprint", "digest", "sha256"}
-_SCIENTIFIC_BODIES = {"model", "objective", "transform", "config", "scientific_parameters",
+_SCIENTIFIC_BODIES = {"model", "objective", "transform", "training", "config", "scientific_parameters",
     "metrics", "scores", "paired_scores", "native_facts", "parameters", "hyperparameters"}
 
 
@@ -92,25 +85,6 @@ def _source(value: Any) -> dict:
     return result
 
 
-def _memory(value: Any) -> dict:
-    if not isinstance(value, dict):
-        return {"items": _science(value)} if value else {}
-    items = value.get("items") or []
-    # Absence is meaningful, but embedding models, timings and query hashes are
-    # not design evidence. Preserve non-success state rather than inventing a hit.
-    result = {"items": _science(items)}
-    status = value.get("status")
-    if status is not None:
-        result["status"] = status
-    elif not items:
-        if value.get("backend") == "disabled" or value.get("reason") == "disabled":
-            result["status"] = "disabled"
-        else:
-            unavailable = value.get("degraded") or value.get("query_status") in {"failed", "unavailable"}
-            result["status"] = "retrieval_unavailable" if unavailable else "no_related_memory"
-    return result
-
-
 def _feedback(value: Any) -> Any:
     if not isinstance(value, dict):
         return copy.deepcopy(value)
@@ -121,51 +95,33 @@ def _feedback(value: Any) -> Any:
     return result
 
 
-def _resource_limits(budget: Any) -> dict:
-    """Effective method resources, without replaying the owner/API ledger."""
-    if not isinstance(budget, dict):
-        return {}
-    owner = budget.get("owner_budget")
-    available = owner.get("owner_available") if isinstance(owner, dict) else {}
-    available = available if isinstance(available, dict) else {}
-    result = {}
-    for field, dimension in (("gpu_seconds_left", "gpu_seconds"), ("training_jobs_left", "training_jobs")):
-        known = []
-        unknown = False
-        for source, key in ((budget, field), (available, dimension)):
-            if key not in source:
-                continue
-            value = source[key]
-            if value is None:
-                unknown = True
-            elif type(value) in (int, float) and math.isfinite(value):
-                known.append(value)
-        if known:
-            result[field] = min(known)
-        elif unknown:
-            result[field] = None
-    return result
-
-
-def _share_basis_observations(result: dict) -> None:
-    """Keep an identical observation body once, without merging scope/detail."""
-    basis = result.get("selection_basis") or {}
-    rows = basis.get("basis_observations") if isinstance(basis, dict) else None
-    if not isinstance(rows, list):
-        return
-    by_id = {row["observation_id"]: (index, row) for index, row in enumerate(rows)
-             if isinstance(row, dict) and isinstance(row.get("observation_id"), str)}
-    memory = result.get("retrieved_memory") or {}
-    for item in memory.get("items") or []:
-        if not isinstance(item, dict) or not isinstance(item.get("body"), dict):
-            continue
-        body = item["body"]
-        shared = by_id.get(body.get("observation_id"))
-        # Same identity alone is insufficient: an index row and a detail card
-        # can legitimately expose different facts. Retain both unless exact.
-        if shared and body == shared[1]:
-            item["body"] = {"observation_id": body["observation_id"],
-                            "provided_in": "/selection_basis/basis_observations/" + str(shared[0])}
+def _current_experiment_setting(task: dict, view: dict) -> dict:
+    """Embed selected native settings, without choosing training hyperparameters."""
+    setting = {}
+    scope = task.get("evaluation_scope")
+    if isinstance(scope, dict):
+        setting["evaluation_scope"] = _science(scope)
+        folds = scope.get("folds")
+        if isinstance(folds, list) and folds:
+            setting["required_fold_count"] = len(folds)
+    draft = view.get("draft") or {}
+    for key in ("parent_candidate_id", "control_candidate_id"):
+        if draft.get(key) is not None:
+            setting[key] = draft[key]
+    # Match native assembly: draft overrides the selected task, then the phase
+    # supplies the existing default. A projected/global label is not authority.
+    selected = view.get("selected_research_task") or {}
+    fidelity = draft.get("initial_fidelity", selected.get("initial_fidelity"))
+    if not fidelity and isinstance(scope, dict):
+        fidelity = "pilot" if scope.get("phase") == "pilot" else "full"
+    if fidelity is not None:
+        setting["training_fidelity"] = {"value": fidelity,
+            "meaning": ("Each selected fold uses the complete training recipe chosen for this method. "
+                        "This does not select additional folds." if fidelity == "full" else
+                        "Use the pilot training recipe on the selected evaluation scope.")}
+    if "completion_condition" in task:
+        setting["completion_condition"] = copy.deepcopy(task["completion_condition"])
+    return setting
 
 
 def project_designer_input(full_payload: dict[str, Any]) -> dict[str, Any]:
@@ -178,21 +134,19 @@ def project_designer_input(full_payload: dict[str, Any]) -> dict[str, Any]:
         full_payload = {**full_payload, "previous_response": json.dumps(
             full_payload["previous_response"], ensure_ascii=False, sort_keys=True)}
     if is_designer_input("experiment_designer", full_payload):
-        return copy.deepcopy(full_payload)
+        result = copy.deepcopy(full_payload)
+        result.pop("resource_limits", None)
+        return result
     view = _expanded(full_payload)
     result = {"designer_context_version": VERSION}
     goal = _pick(view.get("goal"), _GOAL)
-    for section, fields in {
-        "screening": ("fold_count", "subjects", "selection", "selection_seed", "training_recipe", "min_mean_gain_pp"),
-        "confirmation": ("fold_count", "freeze_method_before_screening", "subject_aggregation"),
-    }.items():
-        detail = _science(_pick((view.get("goal") or {}).get(section), fields))
-        if detail:
-            goal[section] = detail
     if goal:
         result["goal"] = goal
     task = _pick(view.get("selected_research_task"), _TASK)
     if task:
+        result["current_experiment_setting"] = _current_experiment_setting(task, view)
+        task.pop("evaluation_scope", None)
+        task.pop("completion_condition", None)
         if "task_description" in task:
             task["method"] = task.pop("task_description")
         if "scientific_intent" in task:
@@ -200,7 +154,7 @@ def project_designer_input(full_payload: dict[str, Any]) -> dict[str, Any]:
     if task:
         result["selected_research_task"] = _science(task)
     draft = view.get("draft") or {}
-    for key in ("initial_fidelity", "negative_sampling_policy"):
+    for key in ("negative_sampling_policy",):
         value = view.get(key, draft.get(key))
         if value is not None:
             result[key] = copy.deepcopy(value)
@@ -208,24 +162,30 @@ def project_designer_input(full_payload: dict[str, Any]) -> dict[str, Any]:
         draft_science = _pick(draft, ("hypothesis", "intervention", "principal_intervention"))
         if draft_science:
             result["draft"] = draft_science
-    for key in ("selection_basis", "confirmation_policy", "evaluation_contract", "evaluation_population",
-                "contract", "diagnostics", "method_suite", "method_screening", "analyses",
-                "verified_development_facts", "verified_encoder_structural_facts", "measured_parameter_counts",
-                "parameter_count_comparisons", "method_evidence_packet", "design_revision", "prior_design_brief"):
+    for key in ("evaluation_contract", "measured_parameter_counts", "artifact_reads",
+                "design_revision", "prior_design_brief"):
         if view.get(key) is not None and view[key] != [] and view[key] != {}:
             body = _science(view[key])
-            if key in {"measured_parameter_counts", "parameter_count_comparisons"} and isinstance(body, dict):
+            if key == "measured_parameter_counts" and isinstance(body, dict):
                 body.pop("scope", None)
+                from .designer_contract import _delivered_references
+                refs, _, _ = _delivered_references({key: body})
+                # Native counts have no ID. Bind this delivered section only;
+                # an existing legal identity remains the citation authority.
+                if body and not any(isinstance(value, str) and value in refs for value in body.values()):
+                    body["source_ref"] = "measured_parameter_counts"
             if key == "prior_design_brief" and isinstance(body, dict):
                 # The task fixes the expected observation; a revision must not echo it.
                 body.pop("expected_observation", None)
             if body:
                 result[key] = body
-    for key in ("evaluation_mode", "scientific_unit", "science_scope", "scope", "cold_start_prior"):
-        if key in view and view[key] is not None and (key not in goal or goal[key] != view[key]):
-            result[key] = _science(view[key])
     capabilities = view.get("capabilities") or {}
-    interface = _pick(view.get("candidate_interface") or capabilities.get("input_spec"), _INTERFACE)
+    native_interface = view.get("candidate_interface") or capabilities.get("input_spec") or {}
+    interface = _pick(native_interface, _INTERFACE)
+    # These definitions are needed to choose a valid check, not check receipts.
+    verification = _pick(native_interface.get("implementation_requirements"), ("verification",))
+    if verification:
+        interface["implementation_requirements"] = verification
     if interface:
         result["candidate_interface"] = interface
     capability_view = {key: {name: _pick(item, ("status", "default", "when", "description"))
@@ -233,30 +193,19 @@ def project_designer_input(full_payload: dict[str, Any]) -> dict[str, Any]:
         ("hooks", "task_adapters", "negative_sampling_policies") if isinstance(capabilities.get(key), dict)}
     if capability_view:
         result["capabilities"] = capability_view
-    for key in ("parent_source", "control_source"):
+    for key in ("parent_source",):
         if view.get(key):
             from .context.representations import without_local_paths
             result[key] = without_local_paths(_source(view[key]))
     config = view.get("parent_hook_config")
     if isinstance(config, dict):
-        result["parent_hook_config"] = _pick(config, ("model", "objective", "transform", "negative_sampling_policy"))
-    # Provenance for method cards says whether the supplied material is a local
-    # card, excerpt or actual source. Do not upgrade a path into a full read.
-    if view.get("method_evidence"):
-        result["method_evidence"] = [_science(_pick(item, ("method_id", "title", "mechanism", "when",
-            "assumptions", "failure_modes", "required_inputs", "compatible_capabilities", "evidence_limit",
-            "source_refs", "task_fit", "intervention"))) for item in view["method_evidence"]]
-        if view.get("method_evidence_origin"):
-            result["method_evidence_origin"] = view["method_evidence_origin"]
-    for key in ("retrieved_memory", "retrieved_knowledge"):
-        if key in view:
-            result[key] = _memory(view[key])
-    limits = _resource_limits(view.get("budget"))
-    if limits:
-        result["resource_limits"] = limits
+        result["parent_hook_config"] = _pick(config, ("model", "objective", "transform", "training", "negative_sampling_policy"))
     unavailable = view.get("unavailable_context", view.get("missing_inputs"))
     if unavailable:
-        result["unavailable_context"] = copy.deepcopy(unavailable)
+        historical = {"diagnostics", "method_evidence", "analyses", "retrieved_memory", "retrieved_knowledge"}
+        unavailable = [item for item in unavailable if item not in historical] if isinstance(unavailable, list) else unavailable
+        if unavailable:
+            result["unavailable_context"] = copy.deepcopy(unavailable)
     instruction = view.get("current_user_instruction")
     if instruction:
         result["current_user_instruction"] = (_pick(instruction, ("request_zh", "requested_task_kind"))
@@ -274,7 +223,10 @@ def project_designer_input(full_payload: dict[str, Any]) -> dict[str, Any]:
     for key in ("previous", "previous_reply", "previous_response"):
         if view.get(key) is not None:
             result[key] = _science(view[key])
-    _share_basis_observations(result)
+    from .designer_contract import delivered_citation_examples
+    examples = delivered_citation_examples(result)
+    if examples:
+        result["citation_examples"] = examples
     return deduplicate(result)
 
 
@@ -290,8 +242,8 @@ def designer_assembly_context(full_payload: dict[str, Any]) -> dict[str, Any]:
 def designer_allowed_refs(delivered_payload: dict[str, Any]) -> frozenset[str]:
     """Only real delivered materials, excluding example/correction citations.
 
-    Path-only method cards permit attribution to that card's source; this is not
-    a claim that its file contents were read. Scope stays with the supplied card.
+    Only bound parent source and explicitly delivered materials permit a
+    citation; historical selection records are not part of this role's evidence.
     """
     result: set[str] = set()
     def visit(value):

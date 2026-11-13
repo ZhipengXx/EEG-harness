@@ -97,8 +97,8 @@ def create(study: Path, template: dict, data_root: Path, gpus: tuple[int, ...], 
     )
 
     study, data_root = study.resolve(), data_root.resolve()
-    if len(gpus) < 2 or len(set(gpus)) != len(gpus):
-        raise ValueError("study_requires_multiple_distinct_gpus")
+    if not gpus or len(set(gpus)) != len(gpus):
+        raise ValueError("study_requires_one_or_more_distinct_gpus")
     inventory = gpu_inventory(gpus, allow_shared=allow_shared_gpus)
     GoalSpec.model_validate(template)
     required = {"training_seeds": [0], "confirmation_target_pairs": 1, "max_candidates": 1,

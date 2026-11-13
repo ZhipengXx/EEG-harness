@@ -15,7 +15,7 @@ from .design_contract import (
     DesignContractError, NATIVE_MEASUREMENT_PREFIX, SECTIONS, materialize_design_brief,
     native_measurement_requirements,
 )
-from .schemas import DesignerBrief, DesignerReply
+from .schemas import DesignerBrief, DesignerReply, TrainingRecipe
 
 
 def _context_value(context: dict, name: str, default=None):
@@ -98,6 +98,47 @@ def _valid_reference(reference: str, refs: set[str], sources: dict[str, dict]) -
     return "source" in source and line is not None and 1 <= int(line) <= len(text.splitlines())
 
 
+def delivered_citation_examples(context: dict) -> list[str]:
+    """Give source examples and one direct identity per supplied material."""
+    import ast
+    refs, sources, ambiguous = _delivered_references(context)
+    examples = []
+    for path, source in sources.items():
+        if path in ambiguous or path.startswith("/"):
+            continue
+        text = source.get("source", source.get("excerpt"))
+        try:
+            tree = ast.parse(text)
+        except (SyntaxError, ValueError):
+            examples.append(path)
+            continue
+        symbol = None
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                method = next((item for item in node.body if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                               and item.name.startswith("build_")), None)
+                symbol = node.name + ("." + method.name if method else "")
+                break
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                symbol = node.name
+                break
+        examples.append(path + "::" + symbol if symbol else path)
+    # Keep navigation next to the existing source examples. Nested references
+    # in an artifact are not another catalog to repeat in the request.
+    identity_keys = ("artifact_id", "evidence_id", "observation_id", "record_id", "source_ref",
+                     "$context_source", "method_id", "lesson_id", "knowledge_id", "url", "uri", "path", "id")
+    for field in ("artifact_reads", "measured_parameter_counts"):
+        material = _context_value(context, field)
+        for row in material if isinstance(material, list) else [material]:
+            if not isinstance(row, dict):
+                continue
+            reference = next((row[key] for key in identity_keys if isinstance(row.get(key), str)
+                and row[key] in refs and row[key] not in sources and not row[key].startswith("/")), None)
+            if reference is not None:
+                examples.append(reference)
+    return list(dict.fromkeys(examples))
+
+
 def _schema_errors(exc: ValidationError) -> list[dict]:
     errors = []
     for row in exc.errors():
@@ -116,6 +157,23 @@ def _native_task(context: dict) -> dict:
         "parent_candidate_id", "control_candidate_id", "initial_fidelity", "negative_sampling_policy") if key in draft}}
 
 
+def _multigpu_population(context: dict) -> tuple[int, int] | None:
+    interface = _context_value(context, "candidate_interface")
+    if not isinstance(interface, dict):
+        capabilities = _context_value(context, "capabilities", {})
+        interface = capabilities.get("input_spec", {}) if isinstance(capabilities, dict) else {}
+    if not isinstance(interface, dict):
+        return None
+    check = interface.get("multigpu_check", {})
+    if not isinstance(check, dict):
+        return None
+    cards, samples = check.get("gpu"), check.get("training_sample_count")
+    if (check.get("enabled") is True and isinstance(cards, list) and len(cards) > 1
+            and type(samples) is int and samples >= 0):
+        return len(cards), samples
+    return None
+
+
 def validate_designer_native_context(native_context: dict) -> list[dict]:
     """Check existing frozen binding/fidelity rules before spending an API call."""
     task = _native_task(native_context)
@@ -123,12 +181,16 @@ def validate_designer_native_context(native_context: dict) -> list[dict]:
     parent = _context_value(native_context, "parent_hook_config", {})
     invalid_parent_type = not isinstance(parent, dict)
     parent = parent if isinstance(parent, dict) else {}
-    parent_id = str(task.get("parent_candidate_id") or proposal.get("parent_candidate_id")
+    selected_parent = proposal.get("parent_ref")
+    parent_id = str(task.get("parent_candidate_id") or proposal.get("parent_candidate_id") or selected_parent
                     or parent.get("target_id") or "baseline")
     errors = []
 
     def error(location, reason):
         errors.append({"type": "designer_native_input_invalid", "loc": location, "msg": reason})
+
+    if selected_parent is not None and selected_parent != parent_id:
+        error(["draft", "parent_candidate_id"], "selected_parent_binding_mismatch")
 
     for field in ("draft", "selected_research_task"):
         if not isinstance(_context_value(native_context, field, {}), dict):
@@ -146,6 +208,14 @@ def validate_designer_native_context(native_context: dict) -> list[dict]:
         error(["parent_hook_config"], "parent_hook_config_invalid")
     if parent.get("target_id") and parent["target_id"] != parent_id:
         error(["parent_hook_config", "target_id"], "parent_hook_config_identity_mismatch")
+    if "training" in parent:
+        try:
+            TrainingRecipe.model_validate(parent["training"])
+        except ValidationError:
+            error(["parent_hook_config", "training"], "parent_training_config_invalid")
+    population = _multigpu_population(native_context)
+    if population is not None and population[1] < population[0]:
+        error(["candidate_interface", "multigpu_check"], "training_samples_cannot_cover_frozen_cards")
     scope = proposal.get("evaluation_scope") or task.get("evaluation_scope") or {}
     if not isinstance(scope, dict):
         error(["selected_research_task", "evaluation_scope"], "evaluation_scope_invalid")
@@ -267,11 +337,13 @@ def validate_designer_reply(raw: Any, native_context: dict,
             if rid in seen:
                 error("duplicate_stage_requirement_id", loc, "requirement_id must be unique across stages: " + rid)
             seen.add(rid)
-    if (reply["status"] == "completed" and not reply["missing_inputs"]
+    from .design_contract import is_training_only_change
+    training_only = is_training_only_change(content)
+    if (reply["status"] == "completed" and not reply["missing_inputs"] and not training_only
             and task.get("task_kind", "new_method") == "new_method"
             and not any(row["core"] for row in content["implementation_requirements"])):
         error("designer_core_implementation_missing", ["design_brief", "implementation_requirements"],
-              "A completed new_method requires at least one core implementation requirement.")
+              "A completed new_method with candidate code changes requires at least one core implementation requirement.")
     if errors:
         return result
 
@@ -299,11 +371,23 @@ def validate_designer_reply(raw: Any, native_context: dict,
                                        _context_value(native_context, "parent_hook_config", {}))
     except (DesignContractError, ValidationError) as exc:
         reason = exc.reason if isinstance(exc, DesignContractError) else str(exc.errors()[0]["loc"])
-        if isinstance(exc, DesignContractError) and (reason.startswith("parent_hook_config") or reason == "fidelity_invalid"):
+        if isinstance(exc, DesignContractError) and (reason.startswith(("parent_hook_config", "parent_training_config")) or reason == "fidelity_invalid"):
             result["native_errors"].append({"type": "designer_native_input_invalid", "loc": ["parent_hook_config"], "msg": reason})
         else:
             error("design_contract_invalid", ["design_brief"], reason)
         return result
+    population = _multigpu_population(native_context)
+    if population is not None:
+        from .interface import training_batch_sizes, training_replica_count
+        card_count, samples = population
+        first_batch, _ = training_batch_sizes(spec["training"], sample_count=samples)
+        replicas = training_replica_count(first_batch, card_count)
+        if replicas < card_count:
+            error("designer_training_batch_invalid", ["design_brief", "training_change", "config", "batch_size"],
+                  f"The actual first batch {first_batch} produces {replicas} DataParallel replicas for "
+                  f"{card_count} frozen GPUs. Choose a batch that activates all cards, for example "
+                  f"a multiple of {card_count} within the {samples} training samples.")
+            return result
     # Standard hook capabilities are inferred once and written to the stored
     # brief as well as the executable record, so downstream views agree.
     spec["design_brief"]["required_capability_ids"] = copy.deepcopy(spec["required_capability_ids"])

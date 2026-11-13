@@ -5,7 +5,7 @@ import copy
 import json
 
 from .plan_protocol import (freeze_proposal_pool, normalize_critique,
-                            normalize_proposal_pool, proposal_cost, round_id)
+                            normalize_proposal_pool, round_id)
 from .planning_context import (build_critic_input, build_proposer_input,
                                delivered_observation_ids)
 
@@ -109,12 +109,21 @@ def decide_staged_plan(camp, state, full, delivered, planner, critic, planning_o
         stages[stage] = copy.deepcopy(raw)
         return raw
 
+    def report(stage, backend, raw, result):
+        publish = getattr(backend, "record_validation", None)
+        if callable(publish):
+            publish(rid + ":" + stage, raw, result)
+        else:
+            from .llm import record_role_validation
+            record_role_validation(camp, rid + ":" + stage, raw, result)
+
     proposer_input = build_proposer_input(full, delivered)
     full["_delivered_context_refs"] = _delivered_references(proposer_input, full)
     # Snapshots keep ``full`` exact; only validation sees what was delivered.
     checked = {**full, "_delivered_observation_ids": delivered_observation_ids(proposer_input)}
     raw = request("generation", planner, proposer_input)
     parsed = normalize_proposal_pool(raw, checked)
+    report("generation", planner, raw, parsed)
     _publish_assembly(camp, full, parsed, raw, "generation")
     if parsed.get("native_errors"):
         return {**parsed, "proposal_history": list(stages.values())}
@@ -132,6 +141,8 @@ def decide_staged_plan(camp, state, full, delivered, planner, critic, planning_o
                                     for proposal in parsed.get("valid_proposals") or []],
                 "remaining_slots": max(0, 4 - len(parsed.get("valid_proposals") or [])),
                 "instruction": "Valid proposals are already retained locally. Return only replacement or additional distinct proposals; do not repeat or modify retained proposals, rank, evaluate or select."}}
+        from .llm import mechanical_correction_payload
+        repair = mechanical_correction_payload(repair, parsed.get("errors") or [], role="research_planner")
         from .llm import LlmUnavailable
         try:
             raw = request(stage, planner, repair)
@@ -141,6 +152,7 @@ def decide_staged_plan(camp, state, full, delivered, planner, critic, planning_o
             return {**parsed, "proposal_history": list(stages.values()),
                     "correction_unavailable": {"reason": str(exc), "status": "not_sent"}}
         parsed = normalize_proposal_pool(raw, checked, existing=parsed.get("valid_proposals"), stage=stage)
+        report(stage, planner, raw, parsed)
         _publish_assembly(camp, full, parsed, raw, stage)
         if parsed.get("native_errors"):
             return {**parsed, "proposal_history": list(stages.values())}
@@ -150,8 +162,9 @@ def decide_staged_plan(camp, state, full, delivered, planner, critic, planning_o
     pool = parsed["pool"]
     feasible, rejected = [], []
     for proposal in pool["proposals"]:
+        cost = pool["native_cost_by_id"][proposal["proposal_id"]]
         preview = preview_selected_plan(camp, task_kind=proposal["task_kind"],
-            known_cost=proposal_cost(proposal, full)["known"], recovery_limits=limits)
+            known_cost=cost.get("planning_envelope_cost", cost["known"]), recovery_limits=limits)
         if preview.get("ok"):
             feasible.append(proposal)
         else:
@@ -195,6 +208,7 @@ def decide_staged_plan(camp, state, full, delivered, planner, critic, planning_o
     critic_input = build_critic_input(full, critic_science, pool, critic_context=critic_context)
     raw = request("critic", critic, critic_input, native_pool=pool, critic_context=critic_context)
     result = normalize_critique(raw, pool, checked, critic_context=critic_context)
+    report("critic", critic, raw, result)
     if result.get("native_errors"):
         return {**result, "proposal_history": list(stages.values())}
     critic_limit = min(cfg.max_critic_api_attempts, role_api_attempt_limit(goal, "research_critic"))
@@ -206,6 +220,8 @@ def decide_staged_plan(camp, state, full, delivered, planner, critic, planning_o
                 "instruction": "Return a complete ordered evaluations list, each frozen proposal_ref exactly once. The first item is preferred. Fix the listed errors without altering or inventing proposals; numeric ranks and selected IDs are filled locally."},
             "previous_response": json.dumps(raw, ensure_ascii=False),
             "previous_response_error": _response_feedback(result, role="critic")}
+        from .llm import mechanical_correction_payload
+        repair = mechanical_correction_payload(repair, result.get("errors") or [], role="research_critic")
         from .llm import LlmUnavailable
         try:
             raw = request(stage, critic, repair, native_pool=pool,
@@ -216,6 +232,7 @@ def decide_staged_plan(camp, state, full, delivered, planner, critic, planning_o
             return {**result, "proposal_history": list(stages.values()),
                     "correction_unavailable": {"reason": str(exc), "status": "not_sent"}}
         result = normalize_critique(raw, pool, checked, critic_context=critic_context)
+        report(stage, critic, raw, result)
         if result.get("native_errors"):
             return {**result, "proposal_history": list(stages.values())}
     result["proposal_history"] = list(stages.values())

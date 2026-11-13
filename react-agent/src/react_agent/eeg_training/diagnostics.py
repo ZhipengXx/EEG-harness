@@ -153,29 +153,21 @@ def representation_from_vectors(vectors: list[list[float]]) -> dict[str, Any]:
                 "mean_dimension_variance": (sum(variances) / width) if width else 0.0,
                 "effective_rank": None,
                 "effective_rank_definition": "participation_ratio_of_centered_covariance_eigenvalues",
-                "method": "thin_svd_of_centered_samples",
+                "method": "gram_trace_participation_ratio",
                 "centered": True,
                 "reason": "constant_or_insufficient_samples",
             },
         )
     import math
 
-    try:
-        import numpy as np
+    import numpy as np
 
-        matrix = np.asarray(centered, dtype=float)
-        singular = np.linalg.svd(matrix, compute_uv=False)
-        eigenvalues = [float(value * value) / max(count - 1, 1) for value in singular]
-    except Exception:  # noqa: BLE001
-        gram = [[0.0] * width for _ in range(width)]
-        for row in centered:
-            for i in range(width):
-                for j in range(width):
-                    gram[i][j] += row[i] * row[j]
-        scale = 1.0 / max(count - 1, 1)
-        eigenvalues = [gram[i][i] * scale for i in range(width)]
-    total = sum(eigenvalues)
-    squares = sum(value * value for value in eigenvalues)
+    matrix = np.asarray(centered, dtype=float)
+    # trace(G)^2 / ||G||_F^2 equals the covariance eigenvalue participation
+    # ratio; its normalization cancels, and the smaller Gram matrix suffices.
+    gram = matrix @ matrix.T if count <= width else matrix.T @ matrix
+    total = float(np.trace(gram))
+    squares = float(np.square(gram).sum())
     if not math.isfinite(total) or squares == 0:
         return _item("undefined", {"sample_count": count, "width": width, "effective_rank": None, "reason": "non_finite_or_zero_spectrum"})
     effective = (total * total) / squares
@@ -188,7 +180,7 @@ def representation_from_vectors(vectors: list[list[float]]) -> dict[str, Any]:
             "mean_dimension_variance": (sum(variances) / width) if width else 0.0,
             "effective_rank": effective,
             "effective_rank_definition": "participation_ratio_of_centered_covariance_eigenvalues",
-            "method": "thin_svd_of_centered_samples",
+            "method": "gram_trace_participation_ratio",
             "centered": True,
             "scope": "supplied_embeddings",
         },
@@ -334,6 +326,8 @@ def write_validation_artifacts(
     *,
     limit: int = 32,
     checkpoint_id: str | None = None,
+    checkpoint_role: str | None = None,
+    checkpoint_epoch: int | None = None,
     sample_seed: int | None = None,
     total_query_count: int | None = None,
     sampling_policy: str = "prefix_of_supplied_queries",
@@ -355,6 +349,8 @@ def write_validation_artifacts(
                 "sample_count": len(vectors),
                 "source": "selected_checkpoint",
                 "checkpoint_id": checkpoint_id,
+                **({"checkpoint_role": checkpoint_role, "checkpoint_epoch": checkpoint_epoch}
+                   if checkpoint_role is not None else {}),
                 "sample_seed": sample_seed,
                 "total_query_count": total_query_count if total_query_count is not None else len(queries),
                 "query_coverage": len(vectors) / (total_query_count or len(queries)) if (total_query_count or queries) else None,
@@ -370,6 +366,8 @@ def write_validation_artifacts(
                 "total_query_count": total_query_count if total_query_count is not None else len(queries),
                 "sampling_policy": sampling_policy, "sample_seed": sample_seed,
                 "limitations": "Retrieval margins/ranks use sampled queries against the full frozen gallery; embedding rank covers at most 16 sampled queries."}
+    if checkpoint_role is not None:
+        coverage.update(checkpoint_role=checkpoint_role, checkpoint_epoch=checkpoint_epoch)
     binding = _read_object(job_dir / "source_binding.json")
     coverage["source_sha256"] = binding.get("file_sha256")
     identity = _read_object(job_dir / "training_inference_identity.json")
@@ -425,8 +423,11 @@ def training_execution(job_dir: Path) -> dict[str, Any]:
                  "objective_is_custom": receipt.get("objective_is_custom"),
                  "optimizer_learning_rates": receipt.get("optimizer_learning_rates"),
                  "embedding_dtype": receipt.get("embedding_dtype"),
+                 **{key: receipt[key] for key in ("objective_samples", "resolved_model_configuration") if key in receipt},
                  "epoch_reduction": receipt.get("loss_epoch_reduction"), "batches": batches,
-                 "coverage": "first_and_tail_training_batches_of_first_epoch",
+                 "coverage": {"replica_batches": "first_and_tail_training_batches_of_first_epoch" if batches else "not_recorded",
+                              "objective_samples": "recorded_forward_samples; last_used_identifies_final_training_batch"}
+                             if "objective_samples" in receipt else "first_and_tail_training_batches_of_first_epoch",
                  "limitations": "Sampled replica reference is not the uniform reference for the complete epoch, and loss alone cannot identify a mechanism."})
 
 

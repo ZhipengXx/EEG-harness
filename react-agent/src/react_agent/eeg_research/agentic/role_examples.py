@@ -622,13 +622,15 @@ def add_role_examples(
 def _designer_brief(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return [_example("inherit_parent_hooks",
         {"selected_intervention": "Train-only EEG offset", "parent_hook_config": {
-            "model": {}, "objective": {}, "transform": {}}},
+            "model": {}, "objective": {}, "transform": {},
+            "training": {"epochs": 50, "lr": 0.00001, "batch_size": 1024, "weight_decay": 0.0001}}},
         {"training_protocol": "Supplied by the runtime"},
         {"status": "completed", "design_brief": {
             "hypothesis": "A train-only offset may improve robustness; evaluate against the matched parent.",
             "principal_intervention": "Add an EEG offset during training only.",
             "hook_changes": {"model": {"mode": "inherit", "config": None}, "objective": {"mode": "inherit", "config": None},
                 "transform": {"mode": "replace", "config": {"offset": 0.125}}},
+            "training_change": {"mode": "inherit", "config": None},
             "scientific_parameters": {},
             "implementation_requirements": [{"requirement_id": "train_only_offset", "scope": "scientific",
                 "core": True,

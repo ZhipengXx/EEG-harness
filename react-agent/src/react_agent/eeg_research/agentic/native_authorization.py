@@ -189,7 +189,7 @@ def authorize_research_recovery(camp: Path, *, authorization_id: str,
         science = manifest(camp)
         if not science.get("framework_dependencies"):
             raise AuthorizationError("research_recovery_scientific_dependencies_missing")
-        verify_dependencies(science["framework_dependencies"])
+        verify_dependencies(science["framework_dependencies"], camp=camp)
         sync(camp, state)
         admissions = _rows(camp / "candidate_admissions.jsonl")
         used = len(admissions) + len(state.get("inherited_candidate_admissions") or [])

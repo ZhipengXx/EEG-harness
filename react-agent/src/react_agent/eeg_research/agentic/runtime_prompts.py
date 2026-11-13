@@ -5,7 +5,6 @@ implementation cases. Mechanical contracts
 are enforced by native validators; only active implementation cases are loaded.
 """
 from __future__ import annotations
-import json
 from pathlib import Path
 
 ROOT = Path(__file__).with_name("prompts") / "runtime_v1"
@@ -23,22 +22,41 @@ def runtime_mission(role: str, *, review_stage: str | None = None) -> str:
 def conditional_hints(role: str, payload: dict) -> dict | None:
     if role not in {"candidate_coder", "candidate_reviewer", "experiment_designer", "result_analyst"}:
         return None
-    # Examine the current task/config/check, not unrelated history or RAG.
-    current = {key: payload[key] for key in ("approved_spec", "experiment", "experiment_spec", "design_brief", "hypothesis", "task", "selected_research_task", "repair_task", "last_check", "check", "recovery_context", "current_feedback", "objective_semantics_probe", "objective_semantic_findings", "probe") if key in payload}
-    text = json.dumps(current, ensure_ascii=False, default=str).lower()
-    matchers = {
-        "positive_mass_infonce": ("positive-mass", "positive_mass", "multi_positive", "logsumexp"),
-        "tied_image_ce": ("tied-image", "tied_image", "shared_image_classifier"),
-        "objective_disabled": ("objective-off", "objective_off", "objective_disabled"),
-        "ordered_pooling": ("ordered_window_slots", "ordered temporal", "window slots"),
-        "capacity": ("parameter_budget", "capacity_match", "capacity-match", "trainable_parameter"),
-        "checkpoint": ("checkpoint_round_trip", "state_dict", "missing key", "unexpected key"),
-    }
-    selected = [name for name, words in matchers.items() if any(word in text for word in words)]
+    # Hints explain existing obligations; prose mentioning a technique or a
+    # successful standard check must not create a new implementation promise.
+    spec = next((payload[key] for key in ("experiment_spec", "approved_spec", "experiment", "design_brief")
+                 if isinstance(payload.get(key), dict) and payload[key]), {})
+    spec = spec.get("experiment") if isinstance(spec.get("experiment"), dict) else spec
+    brief = spec.get("design_brief") or {}
+    objective = (payload.get("effective_hook_config") or {}).get("objective")
+    if objective is None:
+        objective = spec.get("objective") or ((brief.get("hook_changes") or {}).get("objective") or {}).get("config") or {}
+    labels = {str(objective.get(key) or "").lower().replace("-", "_")
+              for key in ("name", "type", "objective_variant")}
+    requirements = spec.get("implementation_requirements", brief.get("implementation_requirements", []))
+    parameters = spec.get("scientific_parameters", brief.get("scientific_parameters", {})) or {}
+    selected = []
+    if any("positive_mass" in label or "multi_positive" in label for label in labels):
+        selected.append("positive_mass_infonce")
+    if any("tied_image" in label or label == "shared_image_classifier" for label in labels):
+        selected.append("tied_image_ce")
+    from .objective_effectiveness import objective_switch
+    if objective_switch(objective):
+        selected.append("objective_disabled")
+    if any(row.get("verification") == "ordered_window_slots" for row in requirements):
+        selected.append("ordered_pooling")
+    if parameters.get("target_parameter_band") is not None:
+        selected.append("capacity")
+    check = payload.get("last_check") or payload.get("check") or {}
+    if check and check.get("ok") is not True:
+        failures = " ".join(str(check.get(key) or "") for key in ("error", "detail", "stage", "failures")).lower()
+        if "checkpoint" in failures or "state_dict" in failures:
+            # A concrete current failure takes priority over general notes.
+            selected.insert(0, "checkpoint")
     notes = []
     for name in selected[:2]:
         body = (ROOT / "cases" / (name + ".txt")).read_text(encoding="utf-8")
-        notes.append({"case_id": name, "applicability": "current_task_keyword_match_verify_against_approved_contract", "instruction": body})
+        notes.append({"case_id": name, "applicability": "approved_configuration_or_current_check_failure", "instruction": body})
     return {"version": PROMPT_VERSION, "notes": notes} if notes else None
 
 

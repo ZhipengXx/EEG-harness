@@ -81,12 +81,24 @@ def start_job(
         protocol = load_protocol(protocol_path.parent)
     if protocol is None:
         protocol = load_protocol(job_dir.parent.parent)
+        protocol_path = job_dir.parent.parent / "execution_protocol.json" if protocol is not None else None
     if protocol is not None:
+        from .run_context import resolve_execution_protocol
+        resolved_protocol = resolve_execution_protocol(job_dir.parent.parent, candidate_id, protocol)
+        if resolved_protocol != protocol:
+            # Keep the research protocol immutable; reconciliation reads the
+            # exact method-specific protocol used for this job's command.
+            protocol_path = job_dir / "execution_protocol.json"
+            protocol_path.write_text(json.dumps(resolved_protocol, ensure_ascii=False, indent=2), encoding="utf-8")
+        protocol = resolved_protocol
         epochs, stop = fidelity_settings(protocol, fidelity)
     else:
         epochs = PILOT_EPOCHS if fidelity == "pilot" else design.epochs
         stop = "single_full" if fidelity == "pilot" else "single_early"
     run_design = replace(design, epochs=epochs, stop=stop, policy="agentic")
+    if protocol is not None:
+        run_design = replace(run_design, lr=protocol["lr"], batch_size=protocol["batch_size"],
+                             weight_decay=protocol.get("weight_decay", 1e-4))
     camp = job_dir.parent.parent
     state_path = camp / "campaign_state.json"
     state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.is_file() else {}
@@ -143,7 +155,29 @@ def start_job(
     if frozen:
         persist_frozen_run_spec(job_dir, frozen)
     from .owner_budget import training_launch_admission
-    owner_launch = training_launch_admission(camp,job_dir.name,max(1,len(run_design.gpu)),now=time.time())
+    n_gpu = max(1, len(run_design.gpu))
+    launch_at = time.time()
+    owner_launch = training_launch_admission(camp, job_dir.name, n_gpu, now=launch_at)
+    if owner_launch:
+        deadline = owner_launch["deadline_at"]
+    else:
+        # The legacy route shares this sole process boundary. Persisted intent
+        # already counts the current job; a direct launch counts it once here.
+        goal_path, cost_path = camp / "goal.json", camp / "cost.json"
+        goal = json.loads(goal_path.read_text(encoding="utf-8")) if goal_path.is_file() else {}
+        cost = json.loads(cost_path.read_text(encoding="utf-8")) if cost_path.is_file() else {}
+        job_ids = {path.parent.name for pattern in ("*/launch_intent.json", "*/controller_launch_intent.json", "*/job.json")
+                   for path in (camp / "jobs").glob(pattern)}
+        job_count = max(int(state.get("training_jobs") or 0), int(cost.get("training_jobs") or 0), len(job_ids))
+        job_count += int(job_dir.name not in job_ids)
+        job_cap = state.get("max_training_jobs", goal.get("max_training_jobs"))
+        if job_cap is not None and job_count > int(job_cap):
+            raise ValueError("training_global_budget_exhausted:training_jobs")
+        gpu_cap = state.get("max_gpu_seconds", goal.get("max_gpu_seconds"))
+        remaining = None if gpu_cap is None else float(gpu_cap) - float(cost.get("gpu_seconds_used") or 0)
+        if remaining is not None and remaining <= 0:
+            raise ValueError("training_global_budget_exhausted:gpu_seconds")
+        deadline = None if remaining is None else wall_deadline(remaining, n_gpu, now=launch_at)
     log = (job_dir / "train.log").open("wb")
     proc = subprocess.Popen(  # noqa: S603
         command,
@@ -153,10 +187,6 @@ def start_job(
         stderr=subprocess.STDOUT,
         start_new_session=True,
     )
-    n_gpu = max(1, len(run_design.gpu))
-    deadline = wall_deadline(float(state.get("gpu_seconds_left") or 0.0), n_gpu, now=time.time())
-    if owner_launch:
-        deadline = owner_launch["deadline_at"] if deadline is None else min(deadline,owner_launch["deadline_at"])
     record = {
         "job_id": job_dir.name,
         "candidate_id": candidate_id,
@@ -169,7 +199,7 @@ def start_job(
         "pid": proc.pid,
         "proc_start": _proc_start(proc.pid),
         "nonce": uuid.uuid4().hex,
-        "started_at": time.time(),
+        "started_at": launch_at,
         "deadline_at": deadline,
 
         "status": "running",

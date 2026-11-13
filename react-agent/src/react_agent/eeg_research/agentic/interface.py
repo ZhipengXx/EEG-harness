@@ -23,14 +23,27 @@ CANDIDATE_INTERFACE = {
     ),
     "build_training_objective": (
         "optional build_training_objective(self, objective_config=None); receives EEG embedding, "
-        "frozen image embedding and runtime positive relations; learnable parameters enter AdamW"
+        "frozen image embedding and runtime positive relations; learnable parameters enter AdamW. "
+        "Return a scalar loss Tensor, or {'loss': total_loss, 'loss_terms': {'infonce': base_loss, "
+        "'covariance_weighted': lambda_value * penalty}} for named weighted contributions. "
+        "Terms are scalar Tensors on the loss device with the same names on every replica; "
+        "runtime detaches and records them from this forward without changing the total loss. "
+        "The same dict may optionally contain 'diagnostics': {'main.effective_scale': scale_used, "
+        "'main.temperature': temperature_used}, with named scalar Tensors on the loss device and stable "
+        "keys across replicas; use branch names for multiple scales. Runtime samples these actual "
+        "forward values separately from averaged loss terms; no diagnostic export is required."
     ),
+    "training_configuration": {
+        "fields": ["epochs", "lr", "batch_size", "weight_decay"],
+        "optimizer": "AdamW", "scheduler": "none",
+        "usage": "Designer selects or inherits the training configuration; the runtime applies it. Coder may reuse unchanged hook code.",
+    },
     "implementation_requirements": {
         "purpose": "Approved core implementation promises are checked individually; predicted Top-1 gains are scientific hypotheses, not pretraining implementation gates.",
         "fields": "requirement_id, kind (implementation/scientific_hypothesis), core, expected_behavior, code_locations, verification, probe",
         "verification": {
             "source_review": "Reviewer identifies the current execution path and exact current source/check receipt references.",
-            "ordered_window_slots": "Only for an explicitly promised ordered temporal representation. Declare real input_module_path at the pool input and representation_module_path at its downstream consumer, slot_count and layout; the checker injects distinct window values at that boundary and observes the real consumer input.",
+            "ordered_window_slots": "Only for an explicitly promised ordered temporal representation. Designer declares only slot_count, window_axis and layout; Coder binds real input_module_path at the pool input and representation_module_path at its downstream consumer. The checker injects distinct window values at that boundary and observes the real consumer input.",
         },
         "limits": "No universal global-pooling ban, raw-EEG permutation rule or predicted improvement requirement. Missing core implementation evidence stays unverified and cannot authorize training.",
     },
@@ -46,10 +59,29 @@ CANDIDATE_INTERFACE = {
         "image features come from the frozen DirectT RN50 cache",
         "train, validation and held-out files are assigned by the frozen split manifest",
         "the trainer imports only extension/eeg_candidate.py and records its hash",
-        "training length and fidelity (pilot 3 epochs, full per goal) are set by the runtime, not by the candidate",
-        "custom objectives use global-batch after encoder gather; baseline default is data_parallel_local",
+        "the runtime executes the approved candidate training configuration; fidelity and checkpoint selection follow the evaluation protocol",
+        "negative_sampling_policy selects data_parallel_local or global_batch; custom objectives inherit the declared policy",
     ],
 }
+
+
+def training_batch_sizes(protocol: dict[str, Any], *, sample_count: int | None = None) -> tuple[int, int]:
+    """Use the production loader's capped batch and its actual final batch."""
+    samples = len(protocol.get("train_query_ids") or []) if sample_count is None else sample_count
+    batch = min(int(protocol["batch_size"]), samples)
+    return (batch, (samples % batch) or batch) if batch > 0 else (0, 0)
+
+
+def training_batch_partition(batch_size: int, n_cards: int) -> list[int]:
+    """Sizes of DataParallel's tensor.chunk shards, including a short final shard."""
+    if batch_size < 1 or n_cards < 1:
+        return []
+    chunk_size = (batch_size + n_cards - 1) // n_cards
+    return [min(chunk_size, batch_size - start) for start in range(0, batch_size, chunk_size)]
+
+
+def training_replica_count(first_batch: int, n_cards: int) -> int:
+    return len(training_batch_partition(first_batch, n_cards))
 
 
 def candidate_interface(protocol: dict[str, Any] | None) -> dict[str, Any]:
@@ -82,15 +114,22 @@ def candidate_interface(protocol: dict[str, Any] | None) -> dict[str, Any]:
             *CANDIDATE_INTERFACE["runtime_guarantees"][1:],
         ]
     if isinstance(protocol, dict) and protocol.get("evaluation_mode") == "loso_method_search":
-        total_batch = int(protocol["batch_size"])
+        total_batch, tail_batch = training_batch_sizes(protocol)
         samples = len(protocol.get("train_query_ids") or [])
+        payload["training_configuration"] = {
+            **CANDIDATE_INTERFACE["training_configuration"], "min_batch_size": len(protocol["gpu"]),
+            "batch_partition": ("Single GPU: the entire batch executes on one device; local negatives cover the whole batch."
+                if len(protocol["gpu"]) == 1 else
+                "DataParallel tensor.chunk; the first batch must populate every declared GPU."),
+        }
         payload["multigpu_check"] = {
             "enabled": True, "evaluation_mode": "loso_method_search", "gpu": list(protocol["gpu"]),
             "batch_size": total_batch, "training_sample_count": samples,
-            "tail_batch_size": (samples % total_batch) or total_batch,
+            "tail_batch_size": tail_batch,
+            "lr": protocol["lr"], "weight_decay": protocol["weight_decay"],
             "negative_sampling_policy": protocol["negative_sampling_policy"],
             "checkpoint_policy": protocol["checkpoint_policy"], "protocol_fingerprint": protocol["fingerprint"],
             "data_scope": "synthetic_training_inputs_only;no_held_out_EEG_or_images",
         }
-        payload["runtime_guarantees"][-1] = "Custom objectives must explicitly support data_parallel_local; the same frozen cards, total batch and actual tail partition are tested by the native synthetic multi-GPU checker before Reviewer approval."
+        payload["runtime_guarantees"][-1] = "Custom objectives must explicitly support data_parallel_local; the same frozen devices, total batch and actual tail partition are tested by the native synthetic GPU checker before Reviewer approval."
     return payload

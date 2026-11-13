@@ -31,7 +31,7 @@ READ_JOURNAL = "artifact_reads.jsonl"
 # meet them: an over-budget projection must be paged or fail before transport.
 ROLE_CONTEXT_BUDGETS = {
     "research_planner": 160_000, "candidate_coder": 160_000,
-    "candidate_reviewer": 160_000, "result_analyst": 120_000,
+    "candidate_reviewer": 160_000, "result_analyst": 256_000,
     "experiment_designer": 120_000, "memory_curator": 100_000,
     "result_auditor": 200_000, "research_librarian": 80_000,
 }
@@ -579,8 +579,9 @@ def compact_role_context(payload: dict[str, Any], role: str, *,
     return result
 
 
-def training_semantics(*, config_only: bool = False) -> list[dict[str, Any]]:
-    """Source evidence for how the trainer calls configs and owns logit scaling."""
+def training_semantics(*, config_only: bool = False, review_spec: dict | None = None,
+                       checks: dict | None = None) -> list[dict[str, Any]]:
+    """Literal caller evidence; prune only branches ruled out by current facts."""
     import ast
     root = Path(__file__).resolve().parents[2] / "eeg_training"
     views = []
@@ -592,6 +593,34 @@ def training_semantics(*, config_only: bool = False) -> list[dict[str, Any]]:
     if config_only:
         selections = (("hooks.py", {"call_configured"}), ("train_entry.py", {"_build_hook"}),
                       ("../eeg_research/agentic/hook_config.py", {"normalize_hook_config"}))
+    elif review_spec is not None:
+        experiment = review_spec.get("experiment") or review_spec
+        modes = experiment.get("hook_modes") or {}
+        checked = checks or {}
+        selected = {name: set(symbols) for name, symbols in selections}
+        if checked.get("ok") is True and checked.get("statistics_hook_available") is False:
+            selected["train_entry.py"].discard("train_channel_statistics")
+            if modes.get("model") == "inherit" and not experiment.get("implementation_requirements"):
+                selected["train_entry.py"].discard("rebuild_encoder")
+        multigpu = checked.get("multigpu_check") or {}
+        actual = multigpu.get("result") or {}
+        if (modes.get("objective") == "inherit" and checked.get("ok") is True
+                and multigpu.get("ok") is True and actual.get("ok") is True
+                and actual.get("custom_objective") is False):
+            selected["hooks.py"].discard("compute_objective")
+        # A previous caller defect still needs its original source context,
+        # even when its branch is no longer selected. Do not infer relevance
+        # from issue prose, or equate an inherited hook with a baseline hook.
+        issues = [*(review_spec.get("repair_issues") or []),
+                  *((review_spec.get("review_focus") or {}).get("issues") or [])]
+        for name, symbols in selections:
+            path = str(root / name)
+            if any(isinstance(ref, str) and (ref == path or ref.startswith(path + ":") or ref.startswith(path + "#L"))
+                   for issue in issues if isinstance(issue, dict)
+                   for field in ("source_refs", "evidence_refs", "code_locations")
+                   for ref in issue.get(field) or []):
+                selected[name] = set(symbols)
+        selections = tuple(selected.items())
     for name, selected in selections:
         path = root / name
         source = path.read_text(encoding="utf-8")
@@ -606,6 +635,11 @@ def training_semantics(*, config_only: bool = False) -> list[dict[str, Any]]:
                                 isinstance(part, ast.Name) and part.id == "bank" for part in target.elts
                             ) for target in item.targets))
                 excerpts.append("\n".join(source.splitlines()[node.lineno - 1:stop - 1]))
+                # Epoch-only designs need the actual loop bound as evidence,
+                # without expanding the full training/evaluation body.
+                epoch_loop = next(item for item in node.body if isinstance(item, ast.For)
+                                  and isinstance(item.target, ast.Name) and item.target.id == "epoch_index")
+                excerpts.append(source.splitlines()[epoch_loop.lineno - 1])
             else:
                 excerpts.append(ast.get_source_segment(source, node))
         views.append({"source_ref": str(path), "source_hash": file_digest(path),
@@ -786,6 +820,12 @@ def candidate_context(camp: Path, target: str) -> dict[str, Any]:
         entry = camp / "candidates" / target / "extension" / "eeg_candidate.py"
         binding = load_approved_binding(camp, target) or {}
         approval_ref = binding.get("spec_ref")
+    from .execution_protocol import training_recipe, with_training_recipe
+    training = binding.get("training")
+    if training is not None:
+        protocol = with_training_recipe(protocol, training)
+    elif all(key in protocol for key in ("full_epochs", "lr", "batch_size")):
+        training = training_recipe(protocol)
     missing = []
     if not entry.is_file():
         missing.append("source")
@@ -820,6 +860,7 @@ def candidate_context(camp: Path, target: str) -> dict[str, Any]:
         "model": binding.get("model") or {},
         "objective": binding.get("objective") or {},
         "transform": binding.get("transform") or {},
+        "training": training,
         "intervention": binding.get("intervention") or ("frozen EEGProjectLayer baseline" if target == "baseline" else None),
         "recipe": {key: protocol.get(key) for key in ("full_epochs", "batch_size", "lr", "weight_decay",
                    "negative_sampling_policy", "training_seeds", "input_geometry")},
@@ -827,7 +868,7 @@ def candidate_context(camp: Path, target: str) -> dict[str, Any]:
         "frozen_training_policy": {"full_epochs": protocol.get("full_epochs"),
             "fidelity_overrides": protocol.get("fidelity_overrides"),
             "training_seeds": protocol.get("training_seeds"),
-            "interpretation": "Maximum epochs and early-stop rules are frozen runtime invariants. A build_encoder hook cannot change them. Fewer realized epochs does not prove unequal budgets."},
+            "interpretation": "This candidate's approved training recipe is fixed for its runs. Designer may select a different recipe for a new method; hooks do not override it. Actual completion is recorded separately."},
         "missing_inputs": missing,
     })
 
@@ -888,6 +929,25 @@ def training_target_source_context(camp: Path, state: dict[str, Any], eligible: 
     return {'by_candidate': {name: candidate_context(camp, name) for name in selected},
             'omitted_target_ids': names[4:], 'source_limit': 4,
             'scope': 'Current source/spec-bound candidate code for eligible training targets. A research proposal or pending design is not this source. Missing/truncated source remains explicit.'}
+
+
+def planner_parent_config_context(camp: Path, state: dict[str, Any]) -> dict[str, Any]:
+    """Read approved parent configuration without loading candidate source code."""
+    reusable = {row['candidate_id'] for row in state.get('candidates') or []
+                if row.get('candidate_id') and row.get('status') == 'ready'}
+    if state.get('candidate_ready') and state.get('candidate_id'):
+        reusable.add(state['candidate_id'])
+    detached = state.get('detached_candidates') or {}
+    result = {}
+    fields = ('model', 'objective', 'transform', 'training', 'scientific_parameters',
+              'negative_sampling_policy')
+    for target in sorted(reusable - {'baseline'} - set(detached)):
+        binding = load_approved_binding(camp, target)
+        if binding is None:
+            continue
+        result[target] = {key: binding[key] for key in fields if key in binding}
+        result[target]['intervention'] = binding.get('principal_intervention') or binding.get('intervention')
+    return result
 
 
 def verified_encoder_structural_facts(camp: Path, state: dict[str, Any], *, target_ids: set[str] | None = None) -> list[dict[str, Any]]:
@@ -1615,8 +1675,10 @@ def selected_read_context(camp: Path, state: dict[str, Any]) -> list[dict[str, A
                                  request_digests=list(state.get("active_read_digests") or []))
 
 
-def analysis_experiment_binding(camp: Path, latest: dict[str, Any]) -> dict[str, Any]:
-    """Bind analysis to the approved spec and source of this exact accepted run."""
+def analysis_experiment_binding(camp: Path, latest: dict[str, Any], *,
+                                verified_result: dict | None = None,
+                                verified_suite: dict | None = None) -> dict[str, Any]:
+    """Bind analysis to this run's approved spec, reusing same-assembly native inputs."""
     from react_agent.eeg_research.agentic.artifacts import resolve_verified_artifact
     from react_agent.eeg_research.agentic.experiment_gate import _spec_hash, experiment_is_approved
     target=str(latest.get("candidate_id") or "")
@@ -1639,20 +1701,27 @@ def analysis_experiment_binding(camp: Path, latest: dict[str, Any]) -> dict[str,
             # A complete method is ten native folds, not a legacy single job.
             # Its immutable suite and source/review dependencies carry the
             # exact approved intent; never fabricate a job_dir or hypothesis.
-            from react_agent.eeg_research.agentic.method_suite import read_aggregate, validate_suite
+            from react_agent.eeg_research.agentic.method_suite import read_aggregate
             from react_agent.eeg_research.agentic.native_patch import enforce_requirement_review
             suite_id = str(latest.get("suite_id") or "")
             if not suite_id or Path(suite_id).name != suite_id or suite_id in {".", ".."}:
                 raise ValueError("method_suite_identity_missing")
-            suite = validate_suite(camp, suite_id)
             suite_path = camp / "suites" / suite_id / "suite_manifest.json"
             screening = latest.get("kind") == "method_screening"
             aggregate_path = suite_path.with_name("screening.json" if screening else "aggregate.json")
-            if screening:
-                from react_agent.eeg_research.agentic.screening import read_screening
-                aggregate = read_screening(camp, suite_id)
-            else:
-                aggregate = read_aggregate(camp, suite_id)
+            if verified_result is None and verified_suite is None:
+                # The native reader validates the relevant protocols itself:
+                # screening keeps its two-fold scope, confirmation uses all folds.
+                suites = {}
+                if screening:
+                    from react_agent.eeg_research.agentic.screening import read_screening
+                    verified_result = read_screening(camp, suite_id, verified_suites=suites)
+                else:
+                    verified_result = read_aggregate(camp, suite_id, verified_suites=suites)
+                verified_suite = suites[suite_id]
+            if verified_result is None or verified_suite is None:
+                raise ValueError("analysis_verified_measurement_incomplete")
+            suite, aggregate = verified_suite, verified_result
             if (latest.get("evaluation_valid") is not True or aggregate != latest.get("screening" if screening else "aggregate")
                     or latest.get("result_hash") != file_digest(aggregate_path)
                     or Path(str(latest.get("suite_ref") or "")).resolve() != aggregate_path.resolve()

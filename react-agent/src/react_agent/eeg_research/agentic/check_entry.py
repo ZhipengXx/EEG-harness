@@ -132,11 +132,13 @@ def run(dataset: str = "eeg", *, context: dict[str, object] | None = None, hook_
     from react_agent.eeg_training.hooks import scalar_loss
     objective_finite = False
     duplicate_objective_finite = None
+    objective_terms = {}
     if finite and tuple(out.shape) == (4, 1024):
-        loss, _, _ = LocalRetrieval(encoder, objective)(batch, torch.randn(4, 1024), torch.arange(4))
+        loss, _, _, objective_terms = LocalRetrieval(encoder, objective)(
+            batch, torch.randn(4, 1024), torch.arange(4), return_loss_terms=True)
         loss = scalar_loss(loss)
         objective_finite = bool(torch.isfinite(loss))
-        if not objective_finite:
+        if not objective_finite or any(not bool(torch.isfinite(value)) for value in objective_terms.values()):
             raise ValueError("non_finite_training_objective")
     else:
         loss = out.float().pow(2).mean()
@@ -248,6 +250,8 @@ def run(dataset: str = "eeg", *, context: dict[str, object] | None = None, hook_
             "Do not remove the normalization hook in fit_statistics; fit updates buffers and preserves the hook installed during every build."
         )
     result = {
+        **({"objective_loss_terms": {name: float(value) for name, value in objective_terms.items()}}
+           if objective_terms else {}),
         "uses_train_statistics": uses_statistics,
         "statistics_hook_available": statistics_hook_available,
         "statistics_stored_as_buffers": stats_in_state,

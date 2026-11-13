@@ -103,15 +103,10 @@ class MiniLMBackend:
         return prepare_embedding_chunks(text, tokenizer=self.model.tokenizer,
             max_tokens=self.metadata["max_sequence_length"], record_id=record_id)
 
-    def prepare_query(self, text: str):
+    def prepare_query(self, query: str | dict):
         from react_agent.eeg_research.agentic.context.retrieval import prepare_query
-        # Keep the selected method/protocol/error cards ahead of potentially
-        # longer prose before applying the actual MiniLM token budget.
-        lines = text.splitlines()
-        priority = ("Action:", "Error:", "Method:", "Protocol:", "IDs:")
-        ordered = [line for line in lines if line.startswith(priority)]
-        ordered.extend(line for line in lines if not line.startswith(priority))
-        return prepare_query(question="\n".join(ordered), tokenizer=self.model.tokenizer,
+        fields = query if isinstance(query, dict) else {"question": query}
+        return prepare_query(**fields, tokenizer=self.model.tokenizer,
                              max_tokens=self.metadata["max_sequence_length"])
 
     def encode(self, texts: list[str]):

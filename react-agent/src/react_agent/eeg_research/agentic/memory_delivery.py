@@ -21,7 +21,7 @@ def _canonical(value):
 _OBSERVATION = frozenset({"observation_kind", "question", "intervention", "execution_status", "summary_zh", "summary",
     "identity", "evaluation_scope", "native_facts", "analyst_interpretation", "engineering_failure",
     "unresolved_questions", "applicability", "applicability_label", "applicability_status",
-    "condition_differences", "current_feedback", "fidelity"})
+    "condition_differences", "current_feedback", "fidelity", "analysis_delivery"})
 _COMMON_BODY = frozenset({"title", "name", "method", "statement", "mechanism", "description",
     "summary", "summary_zh", "idea", "conditions", "preconditions", "scope", "applicability",
     "condition_differences", "applicability_label", "applicability_status", "is_scientific_evidence",
@@ -34,11 +34,12 @@ _NATIVE = frozenset({"phase", "scope", "fidelity", "seed", "coverage", "required
     "full_required_fold_count", "independently_replicated", "screening_fold_ids", "screening_subjects",
     "promotion", "missing", "metrics", "scores", "paired_scores", "paired_delta_pp", "measurement_kind",
     "summary", "native_diagnostics", "diagnostic_selection", "training_recipe", "input_geometry",
-    "learning_profile", "learning_profiles", "folds", "fold_id", "held_out_subject", "baseline_metrics", "candidate_metrics"})
+    "learning_profile", "learning_profiles", "folds", "fold_id", "held_out_subject", "baseline_metrics", "candidate_metrics",
+    "historical_comparisons", "training_execution"})
 _LEARNING_PROFILE = frozenset({"status", "epochs", "last_epoch", "first_train_loss", "last_train_loss",
     "tail_loss", "first_fixed_bank_top1", "last_fixed_bank_top1", "best_epoch", "best_fixed_bank_top1",
     "epochs_since_selected_checkpoint", "checkpoint_selection_status", "read_coverage", "metric_scope",
-    "tail_loss_relative_decrease"})
+    "tail_loss_relative_decrease", "loss_terms"})
 _CONDITIONS = frozenset({"dataset", "modality", "task_type", "regime", "scope", "seed", "fold_id",
     "fold_count", "fold_ids", "screening_subjects", "input_geometry", "training_recipe", "feature_target",
     "intervention", "fidelity", "negative_sampling_policy", "evaluation_mode", "generalization_target"})
@@ -58,16 +59,37 @@ _SCHEMAS = {
     ("native_facts", "learning_profiles", "*", "learning_profile"): _LEARNING_PROFILE,
     ("native_facts", "learning_profiles", "*", "learning_profile", "tail_loss"): frozenset({"rows", "first_epoch", "last_epoch", "start", "end", "decrease", "relative_decrease"}),
     ("native_facts", "learning_profiles", "*", "learning_profile", "read_coverage"): frozenset({"valid_rows", "complete", "truncated", "diagnostics"}),
+    ("native_facts", "training_execution", "*"): frozenset({"arm", "candidate_id", "seed", "fold_count", "common", "per_fold_differences"}),
     ("engineering_failure",): frozenset({"error", "error_category", "reason", "summary", "blocking_issues"}),
     ("evidence_updates", "*"): frozenset({"scope", "verified_fold_coverage", "relation",
         "scientific_strength", "summary", "limitations"}),
     ("native_facts", "native_diagnostics", "*"): frozenset({"fold_id", "held_out_subject", "seed",
         "diagnostics", "learning_profile", "scope", "fidelity"}),
+    ("native_facts", "historical_comparisons", "*"): frozenset({"status", "reason", "arm", "comparison"}),
+    ("native_facts", "historical_comparisons", "*", "comparison"): frozenset({"delta_unit", "mean_delta_basis",
+        "mean_delta_pp", "condition_matches", "condition_differences", "unknown_conditions", "fold_coverage",
+        "fold_deltas", "configuration_comparison_scope", "configuration_differences"}),
+    ("native_facts", "historical_comparisons", "*", "comparison", "mean_delta_pp"): frozenset({"top1", "top5"}),
+    ("native_facts", "historical_comparisons", "*", "comparison", "fold_coverage"): frozenset({"current", "historical", "matched"}),
+    ("native_facts", "historical_comparisons", "*", "comparison", "fold_deltas", "*"): frozenset({
+        "fold_id", "held_out_subject", "seed", "top1_delta_pp", "top5_delta_pp", "condition_differences"}),
     ("applicability",): _CONDITIONS,
     ("conditions",): _CONDITIONS,
     ("preconditions",): _CONDITIONS,
     ("input_geometry",): frozenset({"channels", "timesteps", "c_num", "shape", "sampling_rate", "units"}),
 }
+_EXECUTION_FIELDS = frozenset({"negative_sampling_policy", "objective_is_custom", "loss_definition",
+    "loss_replica_reduction", "coverage", "objective_execution_scope", "configured_replica_count", "batches",
+    "objective_samples", "resolved_model_configuration"})
+for _prefix in (("native_facts", "training_execution", "*", "common"),
+                ("native_facts", "training_execution", "*", "per_fold_differences", "*", "fields")):
+    _SCHEMAS[_prefix] = _EXECUTION_FIELDS
+    _SCHEMAS[_prefix + ("batches", "*")] = frozenset({"epoch", "batch_index", "batch_position",
+        "global_batch_size", "local_batch_sizes"})
+    _SCHEMAS[_prefix + ("objective_samples", "*")] = frozenset({"epoch", "batch_index", "batch_position",
+        "global_batch_size", "sampling_time", "origin", "status", "replica_values", "last_used", "reason", "nonfinite_values"})
+    _SCHEMAS[_prefix + ("resolved_model_configuration",)] = frozenset({"status", "origin", "model_type", "values", "reason"})
+    _SCHEMAS[_prefix + ("coverage",)] = frozenset({"replica_batches", "objective_samples"})
 _ROOT_METADATA = frozenset({"schema_version", "origin_campaign_id", "content_digest", "content_hash",
     "observation_id", "plan_id", "candidate_id", "record_id", "record_type", "lesson_id", "skill_id",
     "version", "record_version", "source_refs", "source_ref", "artifact_id", "read_ref", "source_hash",
@@ -103,6 +125,9 @@ def _metadata(path):
         return frozenset({"evidence_refs"})
     if path == ("native_facts", "learning_profiles", "*", "learning_profile"):
         return frozenset({"source_ref"})
+    if path == ("native_facts", "historical_comparisons", "*"):
+        return frozenset({"observation_id", "candidate_id", "source_ref", "observation_source_ref",
+                          "current_evidence_ref", "same_as_observation_id"})
     if path == ("evidence_updates", "*"):
         return frozenset({"source", "episode_id"})
     return frozenset()
@@ -162,6 +187,8 @@ def _clean_body(value, path=()):
             ignored = ignored - {"evidence_refs"}
         elif path == ("native_facts", "learning_profiles", "*", "learning_profile"):
             ignored = ignored - {"source_ref"}
+        elif path == ("native_facts", "historical_comparisons", "*"):
+            ignored = frozenset()  # Comparison references are delivered once, but are not scientific content tokens.
         elif path == ("evidence_updates", "*"):
             ignored = ignored - {"episode_id"}
         result = {}
@@ -246,6 +273,15 @@ def _schema(path, record_type):
             _SKILL if record_type == "skill" else _LESSON if record_type == "lesson" else _COMMON_BODY)
     if path in _SCHEMAS:
         return _SCHEMAS[path]
+    if (path[-4:-1] == ("objective_samples", "*", "replica_values")
+            and "objective_samples" in _SCHEMAS.get(path[:-4], ())):
+        return frozenset({"value", "replica_count"})
+    if (path[-3:-2] == ("nonfinite_values",) and path[-1:] == ("*",)
+            and "nonfinite_values" in _SCHEMAS.get(path[:-3], ())):
+        return frozenset({"replica_index", "value_kind"})
+    if len(path) == 6 and path[:5] == ("native_facts", "learning_profiles", "*", "learning_profile", "loss_terms"):
+        return frozenset({"first_epoch", "last_epoch", "first", "last", "recorded_epochs", "tail_epochs",
+                          "tail_mean", "selected_epoch_value", "observed_batches", "recorded_epoch_batches"})
     if path[-1:] == ("input_geometry",) and path[:-1] in {
             ("native_facts",), ("applicability",), ("conditions",), ("preconditions",)}:
         return _SCHEMAS[("input_geometry",)]
@@ -254,6 +290,9 @@ def _schema(path, record_type):
                           "baseline_top5", "candidate_top5", "delta_pp"})
     if path == ("condition_differences", "*"):
         return frozenset({"field", "expected", "actual", "current", "historical", "reason", "status"})
+    if (path[:3] == ("native_facts", "historical_comparisons", "*")
+            and path[-2:] in {("condition_differences", "*"), ("configuration_differences", "*")}):
+        return frozenset({"field", "current", "historical"})
     return frozenset()
 
 
@@ -339,7 +378,6 @@ def select_memory_cards(cards, *, content_chars_budget: int, mandatory_ids=(), d
         # The same record can enter through recent and current paths. Preserve
         # the actual current card even if a recent duplicate was listed first.
         card = current_cards.get(identity, card)
-        cost = memory_content_chars(card)
         if identity in seen:
             omitted.append({"record_id": record_id, "record_type": identity[0], "reason": "duplicate_record"})
             continue
@@ -349,6 +387,7 @@ def select_memory_cards(cards, *, content_chars_budget: int, mandatory_ids=(), d
         if not is_mandatory and source_identity is not None and source_identity in seen_sources:
             omitted.append({"record_id": record_id, "record_type": identity[0], "reason": "duplicate_source"})
             continue
+        cost = memory_content_chars(card)
         individual_observation = identity[0] == "experiment_observation" and per_observation_tokens_budget is not None
         if individual_observation:
             tokens, precision, version = memory_content_tokens(card, tokenizer=tokenizer)

@@ -205,7 +205,7 @@ def _validate_fresh_authorization(camp: Path, receipt: dict, seen: set) -> dict:
     return receipt["authorization_caps"]
 
 
-def estimate_suite(receipt: dict, n_gpu: int) -> tuple[float, list[dict]]:
+def estimate_suite(receipt: dict, n_gpu: int, *, target_epochs: int = 50) -> tuple[float, list[dict]]:
     """Conservative ten-full projection of actual historical occupied GPU time."""
     estimates, basis = [], []
     for dep in receipt["dependencies"]:
@@ -224,13 +224,14 @@ def estimate_suite(receipt: dict, n_gpu: int) -> tuple[float, list[dict]]:
         # Global batch remains fixed. Fewer cards can increase wall time, so
         # reducing the assigned card count must not discount measured GPU work.
         # More cards retain the conservative occupied-wall-time projection.
-        projected = float(seconds) / int(epochs) * max(1.0, n_gpu / cards) * 50 * 10 * 1.25
+        projected = float(seconds) / int(epochs) * max(1.0, n_gpu / cards) * target_epochs * 10 * 1.25
         estimates.append(projected)
         basis.append({"job_ref": str(path), "job_sha256": digest(path), "metrics_ref": str(metrics_path),
                       "metrics_sha256": digest(metrics_path), "actual_epochs": epochs, "actual_gpu_seconds": seconds,
                       "historical_gpu_count": cards, "new_gpu_count": n_gpu,
                       "projection_gpu_seconds": projected,
-                      "rule": "max_gpu_seconds_per_epoch*max(1,new_cards/old_cards)*50*10*1.25",
+                      "projected_epochs_per_fold": target_epochs,
+                      "rule": f"max_gpu_seconds_per_epoch*max(1,new_cards/old_cards)*{target_epochs}*10*1.25",
                       "limitation": "Historical projection, not measured speedup; fixed global batch, local-negative cost and new candidate runtime can differ."})
     if not estimates:
         raise ValueError("method_suite_conservative_cost_basis_missing")

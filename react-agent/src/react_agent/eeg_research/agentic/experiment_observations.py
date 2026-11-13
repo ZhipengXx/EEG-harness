@@ -85,11 +85,14 @@ def _read(path: Path) -> dict:
 
 
 class ExperimentObservationStore:
-    def __init__(self, camp: Path):
+    def __init__(self, camp: Path, *, verified_sources: dict | None = None):
         from .semantic_memory import SidecarStore
         self.camp = Path(camp).resolve()
         self.sidecar = SidecarStore(self.camp)
         self.registry = ContextSourceRegistry(self.camp)
+        # Explicitly shared only within one input assembly, never persisted in
+        # a card or reused by the store's ordinary standalone reads.
+        self.verified_sources = verified_sources
         with self.sidecar.connect() as db:
             db.execute("""CREATE TABLE IF NOT EXISTS experiment_observations (
                 namespace TEXT NOT NULL, observation_id TEXT NOT NULL,
@@ -131,16 +134,25 @@ class ExperimentObservationStore:
                  block.source_ref, time.time(), observation_search_text(body), canonical(observation_index_view(body))))
         return body
 
-    def search_records(self, *, context: dict | None = None) -> list[dict]:
+    def search_records(self, *, context: dict | None = None, diagnostic_candidates=()) -> list[dict]:
         """Search every published card without reopening its training provenance.
 
         These records are candidates, not delivered evidence. Retrieval verifies
         selected details with ``records(observation_id=...)`` before delivery.
         """
+        parameters = [self.camp.name]
+        where = "namespace=?"
+        if diagnostic_candidates:
+            placeholders = ",".join("?" for _ in diagnostic_candidates)
+            where += (" AND json_extract(payload,'$.native_facts.measurement_kind') IN "
+                      "('existing_development_diagnostic','full_retrieval_diagnostic')"
+                      " AND EXISTS (SELECT 1 FROM json_each(payload,'$.native_facts.native_diagnostics')"
+                      " WHERE json_extract(value,'$.candidate_id') IN (" + placeholders + "))")
+            parameters.extend(diagnostic_candidates)
         with self.sidecar.connect() as db:
             rows = db.execute("""SELECT payload,source_ref,content_hash,created_at,search_text
-                FROM experiment_observations WHERE namespace=?
-                ORDER BY created_at DESC,observation_id DESC""", (self.camp.name,)).fetchall()
+                FROM experiment_observations WHERE """ + where +
+                " ORDER BY created_at DESC,observation_id DESC", parameters).fetchall()
         result = []
         for row in rows:
             body = json.loads(row["payload"])
@@ -154,16 +166,16 @@ class ExperimentObservationStore:
                 "navigation": {"created_at": row["created_at"], "observation_id": body["observation_id"]}})
         return result
 
-    def history_index(self, *, content_tokens_budget: int = 3000) -> dict:
-        """Bound whole publication-time summaries; never validate campaign history.
+    def history_index(self, *, content_tokens_budget: int = 3000,
+                      detailed_ids=(), summary_records=()) -> dict:
+        """Bound published index rows and selected, already-loaded summaries.
 
         The complete index stays in SQLite. This small view is navigation and
         recorded outcome facts, not delivery of the underlying Analyst findings.
         """
-        from .memory_delivery import memory_content_tokens
-        if isinstance(content_tokens_budget, bool) or not isinstance(content_tokens_budget, int) or content_tokens_budget < 0:
-            raise ValueError("history_content_tokens_budget_must_be_nonnegative_integer")
-        items, used = [], 0
+        summaries = {body["observation_id"]: observation_summary_index(body) for body in summary_records}
+        detailed = set(detailed_ids)
+        items = []
         with self.sidecar.connect() as db:
             rows = db.execute("""SELECT index_payload FROM experiment_observations WHERE namespace=?
                 ORDER BY created_at DESC,observation_id DESC""", (self.camp.name,))
@@ -173,12 +185,17 @@ class ExperimentObservationStore:
                 item = json.loads(row["index_payload"])
                 if not item:
                     continue
-                cost, _, _ = memory_content_tokens(item, record_type="experiment_observation")
-                if used + cost <= content_tokens_budget:
-                    items.append(item)
-                    used += cost
-        return {"items": items, "shown": len(items), "total": total,
-                "omitted_count": total - len(items)}
+                identity = item["observation_id"]
+                if identity in detailed:
+                    item = {key: item[key] for key in ("observation_id", "candidate_id") if key in item}
+                elif identity in summaries:
+                    item = summaries[identity]
+                else:
+                    item.pop("analyst_interpretation", None)
+                items.append(item)
+        # Relevant overflow summaries take precedence over unrelated index rows.
+        items.sort(key=lambda item: item["observation_id"] not in summaries)
+        return fit_history_index(items, total=total, content_tokens_budget=content_tokens_budget)
 
     def valid(self, body: dict, source_ref: str) -> bool:
         from .artifacts import file_digest, resolve_verified_artifact
@@ -195,12 +212,17 @@ class ExperimentObservationStore:
                     row = resolve_verified_artifact(self.camp, ref["artifact_id"])
                     if row["sha256"] != ref.get("sha256"):
                         return False
-                    if ref.get("kind") == "method_screening":
-                        from .screening import read_screening
-                        read_screening(self.camp, Path(row["path"]).parent.name)
-                    elif ref.get("kind") == "method_suite":
-                        from .method_suite import read_aggregate
-                        read_aggregate(self.camp, Path(row["path"]).parent.name)
+                    if ref.get("kind") in {"method_screening", "method_suite"}:
+                        key = (ref["kind"], str(Path(row["path"]).resolve()), row["sha256"])
+                        if self.verified_sources is None or key not in self.verified_sources:
+                            if ref["kind"] == "method_screening":
+                                from .screening import read_screening
+                                read_screening(self.camp, Path(row["path"]).parent.name)
+                            else:
+                                from .method_suite import read_aggregate
+                                read_aggregate(self.camp, Path(row["path"]).parent.name)
+                            if self.verified_sources is not None:
+                                self.verified_sources[key] = True
                     elif ref.get("kind") in {"diagnostic_bundle", "learning_profile"}:
                         report = _read(Path(row["path"]))
                         if any(file_digest(Path(dep["path"])) != dep["sha256"] for dep in report.get("dependencies", [])):
@@ -248,7 +270,77 @@ class ExperimentObservationStore:
         return results
 
 
-def observation_index_view(body: dict) -> dict:
+def related_diagnostic_records(records: list[dict], candidate_ids, *, context=None,
+                               known_observations=()) -> list[dict]:
+    """Locate published diagnostics by their actual sources, not embedding rank.
+
+    Prefer wider measured coverage within one diagnostic definition and seed.
+    A later sampled diagnostic does not replace an older full-gallery result.
+    This selects evidence, and never determines whether a new experiment runs.
+    """
+    targets = set(candidate_ids) - {None, "baseline"}
+    revisions, conditions = {}, {}
+    for body in known_observations:
+        identity = body.get("identity") or {}
+        candidate = identity.get("candidate_id")
+        if candidate in targets and not (body.get("native_facts") or {}).get("measurement_kind"):
+            revisions.setdefault(candidate, identity)
+            conditions.setdefault(candidate, observation_conditions(body))
+    chosen = {}
+    for record in records:
+        body = record["body"]
+        facts = body.get("native_facts") or {}
+        kind = facts.get("measurement_kind")
+        if kind not in {"existing_development_diagnostic", "full_retrieval_diagnostic"}:
+            continue
+        identity = body.get("identity") or {}
+        if any(identity.get(key) is not None and (context or {}).get(key) is not None
+               and identity[key] != context[key] for key in ("dataset", "modality")):
+            continue
+        by_candidate = {}
+        for run in facts.get("native_diagnostics") or []:
+            candidate = run.get("candidate_id")
+            if candidate not in targets:
+                continue
+            revision = revisions.get(candidate, {})
+            if any(run.get(key) is not None and revision.get(key) is not None
+                   and run[key] != revision[key] for key in ("source_hash", "spec_hash", "method_revision")):
+                continue
+            scope = conditions.get(candidate, {})
+            if scope.get("seed") is not None and run.get("seed") is not None and scope["seed"] != run["seed"]:
+                continue
+            if scope.get("fold_ids") and run.get("fold_id") is not None and run["fold_id"] not in scope["fold_ids"]:
+                continue
+            by_candidate.setdefault(candidate, []).append(run)
+        for candidate, runs in by_candidate.items():
+            definitions, coordinates, sizes, complete = [], [], [], []
+            for run in runs:
+                coordinates.append({key: copy.deepcopy(run[key]) for key in (
+                    "fold_id", "held_out_subject", "seed", "source_hash", "spec_hash", "method_revision",
+                    "checkpoint_role", "checkpoint_epoch", "checkpoint_id", "feature_target", "gallery_identity") if key in run})
+                for name, item in ((run.get("diagnostics") or {}).get("items") or {}).items():
+                    if not isinstance(item, dict) or item.get("status") != "observed":
+                        continue
+                    coverage = item.get("coverage") or {}
+                    definitions.append((name, item.get("definition"), item.get("effective_rank_definition"),
+                        item.get("scope"), {key: coverage[key] for key in (
+                            "population", "checkpoint_role", "checkpoint_epoch", "checkpoint_id", "checkpoint",
+                            "feature_target", "gallery_identity", "gallery_count", "total_queries") if key in coverage}))
+                    count = coverage.get("queries", item.get("query_count", item.get("sample_count", 0)))
+                    total = coverage.get("total_queries")
+                    sizes.append(count if isinstance(count, (int, float)) else 0)
+                    complete.append(bool(total and count == total))
+            key = canonical([candidate, kind, sorted({canonical(value) for value in definitions}),
+                             sorted({canonical(value) for value in coordinates})])
+            score = (sum(complete), sum(sizes),
+                     record.get("navigation", {}).get("created_at", 0), record["record_id"])
+            if key not in chosen or score > chosen[key][0]:
+                chosen[key] = score, record
+    unique = {record["record_id"]: (score, record) for score, record in chosen.values()}
+    return [record for _, record in sorted(unique.values(), key=lambda row: row[0], reverse=True)]
+
+
+def observation_index_view(body: dict, *, include_analysis: bool = False) -> dict:
     """One compact native row derived at publication, without a model summary."""
     facts = body.get("native_facts") or {}
     identity = body.get("identity") or {}
@@ -259,7 +351,24 @@ def observation_index_view(body: dict) -> dict:
         "identity": {key: identity[key] for key in ("dataset", "modality") if key in identity},
         "native_facts": {key: copy.deepcopy(facts[key]) for key in (
             "scope", "phase", "seed", "coverage", "required_fold_count", "screening_fold_ids",
-            "metrics", "paired_delta_pp") if key in facts}}
+            "metrics", "paired_delta_pp", "measurement_kind", "diagnostic_request", "diagnostic_status",
+            "missing_outputs", "additional_training_jobs") if key in facts}}
+    if facts.get("native_diagnostics"):
+        coverage = []
+        for run in facts["native_diagnostics"]:
+            diagnostics = run.get("diagnostics") or {}
+            items = diagnostics.get("items") or {}
+            detail = {name: {key: copy.deepcopy(value[key]) for key in (
+                "status", "reason", "scope", "coverage", "sample_count", "effective_rank",
+                "effective_rank_definition", "mean_margin", "rank_interval_mean", "query_count",
+                "gallery_size", "top1", "top5") if key in value}
+                for name, value in items.items() if isinstance(value, dict)
+                and value != {"status": "unavailable", "reason": "unavailable"}}
+            coverage.append({key: copy.deepcopy(run[key]) for key in ("candidate_id", "fold_id", "seed") if key in run}
+                | {"diagnostics": {key: value for key, value in detail.items() if value}})
+        row["native_facts"]["diagnostic_coverage"] = coverage
+    if facts.get("measurement_kind") and facts.get("missing"):
+        row["native_facts"]["missing"] = copy.deepcopy(facts["missing"])
     applicability = body.get("applicability") or {}
     negative_policy = applicability.get("negative_sampling_policy", (applicability.get("training_recipe") or {}).get("negative_sampling_policy"))
     if negative_policy is not None:
@@ -280,19 +389,51 @@ def observation_index_view(body: dict) -> dict:
                         | {"learning_profile": compact})
     if profiles:
         row["native_facts"]["learning_profiles"] = profiles
+    if include_analysis:
+        interpretation = body.get("analyst_interpretation") or {}
+        points = interpretation.get("points") or interpretation
+        summary = {key: copy.deepcopy(points[key]) for key in
+                   ("summary_zh", "summary", "hypothesis_assessment") if key in points}
+        if summary:
+            row["analyst_interpretation"] = summary
     return row
 
 
+def observation_summary_index(body: dict) -> dict:
+    """Reuse the complete paid summary when the full observation is not inline."""
+    return {**observation_index_view(body, include_analysis=True), "analysis_delivery": "summary_only"}
+
+
+def fit_history_index(items: list[dict], *, total: int, content_tokens_budget: int = 3000) -> dict:
+    """Select whole index rows within the existing independent index allowance."""
+    from .memory_delivery import memory_content_tokens
+    if isinstance(content_tokens_budget, bool) or not isinstance(content_tokens_budget, int) or content_tokens_budget < 0:
+        raise ValueError("history_content_tokens_budget_must_be_nonnegative_integer")
+    selected, used = [], 0
+    for item in items:
+        cost, _, _ = memory_content_tokens(item, record_type="experiment_observation")
+        if used + cost <= content_tokens_budget and content_tokens_budget:
+            selected.append(item)
+            used += cost
+    return {"items": selected, "shown": len(selected), "total": total,
+            "omitted_count": total - len(selected)}
+
+
 def observation_search_text(body: dict) -> str:
-    """Only the question/mechanism/error, never full observations or IDs."""
+    """Index the method and its learned interpretation, without duplicating prose."""
     parts = [str(body.get(key) or "") for key in ("question", "intervention")]
+    interpretation = body.get("analyst_interpretation") or {}
+    points = interpretation.get("points") or interpretation
+    for finding in points.get("findings") or []:
+        parts.extend(finding[key] for key in ("interpretation", "implication", "next_step")
+                     if isinstance(finding.get(key), str) and finding[key].strip())
     failure = body.get("engineering_failure") or {}
     parts += [str(failure.get("error") or ""), str(failure.get("error_category") or "")]
     identity = body.get("identity") or {}
     facts = body.get("native_facts") or {}
     scope = {key: facts.get(key) for key in ("scope", "fidelity", "seed") if key in facts}
     scope.update({key: identity[key] for key in ("modality", "dataset") if key in identity})
-    return "\n".join(part for part in parts if part) + "\nApplicable scope: " + canonical(scope)
+    return "\n".join(dict.fromkeys(part.strip() for part in parts if part.strip())) + "\nApplicable scope: " + canonical(scope)
 
 
 def _artifact(camp, ref):
@@ -304,13 +445,20 @@ def _artifact(camp, ref):
 def _single_target_job(camp: Path, entry: dict, protocol: dict) -> tuple[dict, dict, list[dict]]:
     """Read a completed native job through its original source/spec/protocol gates."""
     from .artifacts import file_digest
-    from .execution_protocol import command_matches
+    from .execution_protocol import command_matches, load_protocol, evaluation_comparison_config
     from .handoffs import analysis_experiment_binding
     from .runner import accept_job
     directory = Path(str(entry.get("job_dir") or "")).resolve()
     if directory.parent != (camp / "jobs").resolve() or entry.get("evaluation_valid") is not True:
         raise ValueError("observation_single_target_job_invalid")
     job = _read(directory / "job.json")
+    protocol_path = job.get("protocol_path")
+    if protocol_path:
+        run_protocol = load_protocol(Path(protocol_path).parent)
+        if (run_protocol is None or evaluation_comparison_config(run_protocol)
+                != evaluation_comparison_config(protocol)):
+            raise ValueError("observation_single_target_evaluation_protocol_mismatch")
+        protocol = run_protocol
     frozen = _read(directory / "frozen_run_spec.json")
     binding = _read(directory / "source_binding.json")
     metrics = _read(directory / "metrics.json")
@@ -356,6 +504,8 @@ def _single_target_job(camp: Path, entry: dict, protocol: dict) -> tuple[dict, d
         raise ValueError("observation_single_target_checkpoint_changed")
     paths = [directory / name for name in ("metrics.json", "run_record.json", "source_binding.json",
         "evaluation_identity.json", "frozen_run_spec.json", "hook_config.json", "last.ckpt")]
+    if protocol_path:
+        paths.append(Path(protocol_path))
     if source_path.resolve().is_relative_to(camp.resolve()):
         paths.append(source_path)
     if target != "baseline":
@@ -391,7 +541,7 @@ def _single_target_facts(camp: Path, state: dict, plan: dict, entry: dict) -> tu
     sources += [{"path": str(path), "sha256": file_digest(path), "kind": "native_single_target_identity"}
         for path in (camp / "execution_protocol.json", comparison_path)]
     facts = {key: copy.deepcopy(candidate[key]) for key in ("candidate_id", "source_hash", "spec_hash", "seed", "fidelity",
-        "checkpoint_id", "execution_fingerprint", "job_id") if key in candidate}
+        "checkpoint_id", "execution_fingerprint", "job_id", "training_recipe") if key in candidate}
     facts.update(scope="frozen_development", measurement_kind="native_single_target_job", metric_unit="fraction",
         metrics={key: copy.deepcopy(metrics[key]) for key in ("fixed_bank_top1", "fixed_bank_top5") if key in metrics},
         coverage=1, required_fold_count=1, subjects=[protocol["subject"]], query_count=metrics.get("query_count"),
@@ -399,6 +549,7 @@ def _single_target_facts(camp: Path, state: dict, plan: dict, entry: dict) -> tu
         paired_delta_pp=comparison.get("delta_pp"), promotion=copy.deepcopy(published.get("promotion")),
         paired_baseline={"evidence_id": baseline["evidence_id"], "source_hash": baseline["source_hash"],
             "spec_hash": baseline.get("spec_hash"), "seed": baseline["seed"],
+            "training_recipe": copy.deepcopy(baseline.get("training_recipe")),
             "metrics": {key: copy.deepcopy(baseline_metrics[key]) for key in ("fixed_bank_top1", "fixed_bank_top5") if key in baseline_metrics}}
             if baseline else None,
         missing=[] if baseline or candidate["candidate_id"] == "baseline" else ["matched_baseline"],
@@ -454,7 +605,11 @@ def _native_facts(camp: Path, state: dict, plan: dict) -> tuple[dict, list]:
                 facts.update({key: method[key] for key in ("source_hash", "spec_hash", "method_revision") if key in method})
             elif row["kind"] == "method_suite":
                 from .method_suite import verified_suite_records
-                verified = next(item for item in verified_suite_records(camp, state) if item.get("artifact_id") == ref or item.get("evidence_id") == entry.get("evidence_id"))
+                # Observation may run after a restart: verify its own bound
+                # measurement again, without rescanning unrelated campaigns.
+                verified = next(item for item in verified_suite_records(camp, state,
+                    evidence_ids={entry["evidence_id"]}) if item.get("artifact_id") == ref
+                    or item.get("evidence_id") == entry["evidence_id"])
                 aggregate = verified["aggregate"]
                 if any(plan.get(key) is not None and plan[key] != verified.get(key) for key in ("candidate_id", "source_hash", "spec_hash", "method_revision")):
                     raise ValueError("observation_frozen_plan_measurement_identity_mismatch")
@@ -479,7 +634,8 @@ def _native_facts(camp: Path, state: dict, plan: dict) -> tuple[dict, list]:
                     raise ValueError("observation_diagnostic_source_not_native")
                 if any(file_digest(Path(dep["path"])) != dep["sha256"] for dep in result.get("dependencies", [])):
                     raise ValueError("observation_diagnostic_dependencies_changed")
-                selected = select_verified_facts(camp, state, plan, ref, max_facts=12)
+                selected = select_verified_facts(camp, state, plan, ref, max_facts=12,
+                    verified_report=(row, result))
                 verified, selection = selected["facts"], copy.deepcopy(selected["selection"])
                 readings = []
                 missing = list(selection["missing"])
@@ -495,7 +651,8 @@ def _native_facts(camp: Path, state: dict, plan: dict) -> tuple[dict, list]:
                         missing.append("partial_or_missing_diagnostic_export:" + label)
                 selection["satisfies_development_read_receipt"] = False
                 facts = {"scope": result["diagnostic_scope"], "metrics": None, "paired_delta_pp": None,
-                    "measurement_kind": "existing_development_diagnostic", "source_epoch": result["source_epoch"],
+                    "measurement_kind": result.get("measurement_kind", "existing_development_diagnostic"),
+                    "source_epoch": result["source_epoch"],
                     "diagnostic_status": result["status"], "summary": copy.deepcopy(result.get("summary") or {}),
                     "summary_authority": "native_collector_summary_not_planner_read_receipt",
                     "native_diagnostics": readings, "additional_training_jobs": 0,
@@ -504,6 +661,8 @@ def _native_facts(camp: Path, state: dict, plan: dict) -> tuple[dict, list]:
                     "omitted_scoped_source_count": selection["omitted_scoped_source_count"],
                     "missing": list(dict.fromkeys(missing)),
                     "independently_replicated": False}
+                facts.update({key: copy.deepcopy(result[key]) for key in (
+                    "diagnostic_request", "coverage", "missing_outputs") if key in result})
             else:
                 continue
             sources.append({"artifact_id": ref, "sha256": row["sha256"], "kind": row["kind"]})
@@ -583,6 +742,37 @@ def _current_review_failure(camp: Path, state: dict, plan: dict) -> tuple[dict, 
         "blocking_issues_read_ref": _feedback_handle(record, "/blocking_issues", unit="items", size=len(blocking))}, sources
 
 
+def training_execution_facts(runs: list[dict]) -> list[dict]:
+    """Keep recorded objective batches without rereading histories or probes."""
+    from .analysis_contract import _factored, _run_coordinate, compact_execution_facts
+
+    groups = {}
+    for run in runs:
+        execution = run.get("training_execution") or {}
+        if execution.get("status") != "observed":
+            continue
+        payload = execution.get("payload") or {}
+        facts = {key: copy.deepcopy(payload[key]) for key in (
+            "negative_sampling_policy", "objective_is_custom", "loss_definition",
+            "loss_replica_reduction", "coverage", "objective_samples",
+            "resolved_model_configuration") if key in payload}
+        facts = compact_execution_facts(facts)
+        policy = payload.get("negative_sampling_policy")
+        scope = {"data_parallel_local": "per_replica", "global_batch": "global_batch"}.get(policy)
+        if scope:
+            facts["objective_execution_scope"] = scope
+        devices = ((run.get("config") or {}).get("recipe") or {}).get("gpu")
+        if isinstance(devices, list) and devices:
+            facts["configured_replica_count"] = len(devices)
+        facts["batches"] = [{key: copy.deepcopy(batch[key]) for key in (
+            "epoch", "batch_index", "batch_position", "global_batch_size", "local_batch_sizes") if key in batch}
+            for batch in payload.get("batches") or []]
+        identity = {key: run[key] for key in ("arm", "candidate_id", "seed") if key in run}
+        groups.setdefault(canonical(identity), []).append((_run_coordinate(run), facts))
+    return [{**json.loads(identity), "fold_count": len(rows), **_factored(rows)}
+            for identity, rows in groups.items()]
+
+
 def record_experiment_observation(camp: Path, state: dict, plan: dict, execution_status: str,
                                   analysis_ref: str | None = None) -> dict:
     camp = Path(camp)
@@ -615,8 +805,15 @@ def record_experiment_observation(camp: Path, state: dict, plan: dict, execution
             expected = method_screening_origin(measured) if screening else method_benchmark_origin(measured)
             if explanation.get(key) != expected:
                 raise ValueError("observation_analyst_measurement_origin_mismatch")
-        from .analysis_contract import analysis_memory_view, is_record
+        from .analysis_contract import analysis_memory_view, historical_comparison_memory, is_record
         if is_record(explanation):
+            if explanation.get("origin_plan_id") != plan["plan_id"]:
+                raise ValueError("observation_analyst_task_identity_mismatch")
+            if measured_task:
+                expected_run = plan.get("measurement_evidence_id")
+                analyzed_run = ((explanation.get("native_facts") or {}).get("run_identity") or {}).get("evidence_id")
+                if not expected_run or analyzed_run != expected_run:
+                    raise ValueError("observation_analyst_measurement_identity_mismatch")
             # Staged records keep the complete summary; native facts stay the Observation's own.
             view = analysis_memory_view(explanation)
             # Reuse the locally built summaries already saved with Analysis.
@@ -627,6 +824,12 @@ def record_experiment_observation(camp: Path, state: dict, plan: dict, execution
                 for run in runs if isinstance(run.get("learning_profile"), dict)]
             if profiles:
                 facts["learning_profiles"] = profiles
+            execution_facts = training_execution_facts(runs)
+            if execution_facts:
+                facts["training_execution"] = execution_facts
+            comparisons = historical_comparison_memory(explanation.get("native_facts") or {})
+            if comparisons:
+                facts["historical_comparisons"] = comparisons
             points = {key: view[key] for key in ("hypothesis_assessment", "summary_zh", "limitations", "next_steps")}
             if planning_v2:
                 points["findings"] = copy.deepcopy(view["findings"])
@@ -652,6 +855,8 @@ def record_experiment_observation(camp: Path, state: dict, plan: dict, execution
         failure.setdefault("error_category", "engineering_failure")
     conditions = planner_applicability_context(camp, {**state, "experiment": plan,
         "evaluation_scope": proposal.get("evaluation_scope") or {}})
+    if isinstance(facts.get("training_recipe"), dict):
+        conditions["training_recipe"] = copy.deepcopy(facts["training_recipe"])
     intervention = ((proposal.get("method") or proposal.get("task_description") or proposal.get("scientific_intent"))
                     if planning_v2 else (proposal.get("scientific_intent") or proposal.get("task_description")))
     body = {"origin_campaign_id": camp.name, "plan_id": plan["plan_id"], "observation_kind": "engineering_failure" if engineering else "experiment",
@@ -666,7 +871,7 @@ def record_experiment_observation(camp: Path, state: dict, plan: dict, execution
         "source_refs": sources, "applicability": {**conditions, "campaign_id": camp.name,
             "scope": facts.get("scope", conditions.get("scope")), "seed": facts.get("seed", conditions.get("seed")),
             "scientific_intent_digest": plan.get("scientific_intent_digest")}}
-    if facts.get("measurement_kind") == "existing_development_diagnostic":
+    if facts.get("measurement_kind") in {"existing_development_diagnostic", "full_retrieval_diagnostic"}:
         body["identity"]["binding_level"] = "plan_target_with_per_source_diagnostic_identity"
         body["identity"]["unknown_top_level_fields"] = [key for key in ("source_hash", "spec_hash", "method_revision")
             if body["identity"].get(key) is None]
@@ -703,6 +908,74 @@ def _feedback_handle(record: dict, pointer: str = "", *, unit: str = "json", siz
             "next_read": request}
 
 
+def _comparison_science_view(value: dict, *, fidelity: str | None) -> dict:
+    """Project the native comparison shell, leaving open science maps intact."""
+    result = {key: copy.deepcopy(child) for key, child in value.items()
+              if key not in {"candidate_suite_hash", "control_suite_hash", "schema_version"}}
+    for key in ("training_recipe", "control_training_recipe", "shared_training_recipe"):
+        recipe = result.get(key)
+        if not isinstance(recipe, dict):
+            continue
+        recipe.pop("data_root", None)
+        devices = recipe.pop("gpu", None)
+        if isinstance(devices, list) and devices:
+            # Physical ordinals are bookkeeping; replica count can change the
+            # effective local-negative training setting and remains scientific.
+            recipe.setdefault("configured_gpu_count", len(devices))
+        overrides = recipe.get("fidelity_overrides")
+        if isinstance(overrides, dict) and fidelity in overrides:
+            recipe["fidelity_overrides"] = {fidelity: overrides[fidelity]}
+    candidate, control = result.get("training_recipe"), result.get("control_training_recipe")
+    if isinstance(candidate, dict) and candidate == control and "shared_training_recipe" not in result:
+        result["shared_training_recipe"] = result.pop("training_recipe")
+        result.pop("control_training_recipe")
+    return result
+
+
+def _compact_observation_facts(facts: dict) -> None:
+    """Remove collector receipts and exactly repeated learning-profile values.
+
+    These are already collected native facts; no histories are read and no
+    scientific conclusion is summarized. Per-source diagnostic definitions,
+    populations and measurements remain beside their fold coordinates.
+    """
+    if "training_execution" in facts:
+        from .analysis_contract import compact_execution_facts
+        facts["training_execution"] = compact_execution_facts(facts["training_execution"])
+    for key in ("source_epoch", "summary_authority"):
+        facts.pop(key, None)
+    selection = facts.get("diagnostic_selection")
+    if isinstance(selection, dict):
+        for key in ("complete_source_read_ref", "complete_source_sha256", "selected_job_ids",
+                    "selection_basis", "satisfies_development_read_receipt", "native_report_source_count",
+                    "target_source_count", "scoped_source_count"):
+            selection.pop(key, None)
+        for key in ("delivered_source_count", "omitted_scoped_source_count", "missing"):
+            if key in facts and selection.get(key) == facts[key]:
+                selection.pop(key, None)
+        if selection.get("scope_authority") == facts.get("scope"):
+            selection.pop("scope_authority", None)
+        if not selection:
+            facts.pop("diagnostic_selection")
+    profiles = {}
+    for run in facts.get("learning_profiles") or []:
+        coordinate = (run.get("candidate_id"), run.get("fold_id"), run.get("seed"))
+        if None not in coordinate:
+            profiles.setdefault(coordinate, []).append(run.get("learning_profile") or {})
+    for run in facts.get("native_diagnostics") or []:
+        profile = run.get("learning_profile")
+        matches = profiles.get((run.get("candidate_id"), run.get("fold_id"), run.get("seed")), [])
+        if isinstance(profile, dict) and len(matches) == 1:
+            from .analysis_contract import _without_common
+            remaining = _without_common(profile, matches[0])
+            if remaining.get("reason") is None:
+                remaining.pop("reason", None)
+            if remaining:
+                run["learning_profile"] = remaining
+            else:
+                run.pop("learning_profile")
+
+
 def observation_science_view(body: dict, *, include_analysis: bool = True) -> dict:
     """A pure delivery view; immutable observations remain the complete record.
 
@@ -722,6 +995,9 @@ def observation_science_view(body: dict, *, include_analysis: bool = True) -> di
             identity.pop(key, None)
     facts = result.get("native_facts")
     if isinstance(facts, dict):
+        _compact_observation_facts(facts)
+        if isinstance(facts.get("comparison"), dict):
+            facts["comparison"] = _comparison_science_view(facts["comparison"], fidelity=facts.get("fidelity"))
         for key in ("candidate_id", "method_revision", "source_hash", "spec_hash",
                     "selection_manifest_hash", "baseline_suite_hash"):
             facts.pop(key, None)
@@ -738,8 +1014,10 @@ def observation_science_view(body: dict, *, include_analysis: bool = True) -> di
             applicability.pop(key, None)
         recipe = applicability.get("training_recipe")
         if isinstance(recipe, dict):
-            for key in ("data_root", "gpu"):
-                recipe.pop(key, None)
+            recipe.pop("data_root", None)
+            devices = recipe.pop("gpu", None)
+            if isinstance(devices, list) and devices:
+                recipe.setdefault("configured_gpu_count", len(devices))
             if (applicability.get("input_geometry") is not None
                     and recipe.get("input_geometry") == applicability["input_geometry"]):
                 recipe.pop("input_geometry")
@@ -911,12 +1189,12 @@ def minimum_observation_card(record: dict, *, current: bool = False, context: di
         "next_reads": next_reads, "minimum_feedback_version": "eeg.observation.minimum.v2"}
 
 
-def _legacy_recall_observations(camp: Path, question: str, *, recent=2, relevant=4, char_cap=16000, token_cap=16000,
-                               context: dict | None = None, retrieval_out: dict | None = None) -> dict:
+def _legacy_recall_observations(camp: Path, question: str | dict, *, recent=2, relevant=4, char_cap=16000, token_cap=16000,
+                               context: dict | None = None, retrieval_out: dict | None = None,
+                               verified_sources: dict | None = None) -> dict:
     """Current terminal feedback is mandatory; optional history uses remaining space."""
     from .semantic_memory import retrieve, embedding_health
-    from .context.retrieval import prepare_query
-    store = ExperimentObservationStore(camp)
+    store = ExperimentObservationStore(camp, verified_sources=verified_sources)
     records = store.records(context=context)
     current_id = (context or {}).get("terminal_observation_id")
     current = (store.records(limit=1, observation_id=current_id, context=context) if current_id else records[:1])
@@ -930,8 +1208,9 @@ def _legacy_recall_observations(camp: Path, question: str, *, recent=2, relevant
               "model": config.model_id, "revision": config.model_revision, "fingerprint": None,
               "query": question, "query_status": "not_encoded", "indexing": {"status": "not_requested"}}
     if config.enabled and relevant > 0:
-        query = prepare_query(question=question, identities=[(context or {}).get("candidate_id")])["text"]
-        bundle = retrieve(camp, query, config=config, role="research_planner", context=context)
+        query = question
+        bundle = retrieve(camp, query, config=config, role="research_planner", context=context,
+                          verified_sources=verified_sources)
         health = embedding_health(bundle)
         if bundle.get("degraded") and single_plan_enabled(camp):
             raise ObservationDeliveryRequired(NeedsContext(({
@@ -942,7 +1221,9 @@ def _legacy_recall_observations(camp: Path, question: str, *, recent=2, relevant
             # Current/recent observations and related priors have independent
             # top-k allocations; five recent experiment hits cannot crowd every
             # useful older lesson out of the Planner's knowledge channel.
-            knowledge = retrieve(camp, query, config=config, role="research_planner", context=context,
+            prepared_query = ({"text": bundle["query"], "metadata": bundle["query_representation"]}
+                              if "query_representation" in bundle else query)
+            knowledge = retrieve(camp, prepared_query, config=config, role="research_planner", context=context,
                                  record_types=frozenset({"lesson", "knowledge"}))
             if knowledge.get("degraded"):
                 raise ObservationDeliveryRequired(NeedsContext(({
@@ -1013,8 +1294,9 @@ def _scientific_memory_enabled(camp: Path) -> bool:
     return single_plan_enabled(camp)
 
 
-def recall_observations(camp: Path, question: str, *, recent=2, relevant=4, char_cap=16000, token_cap=16000,
-                        context: dict | None = None, retrieval_out: dict | None = None) -> dict:
+def recall_observations(camp: Path, question: str | dict, *, recent=2, relevant=4, char_cap=16000, token_cap=16000,
+                        context: dict | None = None, retrieval_out: dict | None = None,
+                        verified_sources: dict | None = None) -> dict:
     """Freeze current feedback and related history with independent token allowances.
 
     The legacy char/token arguments remain part of the old compiler API. The
@@ -1022,20 +1304,35 @@ def recall_observations(camp: Path, question: str, *, recent=2, relevant=4, char
     character allowance for other priors, independently of the response contract;
     the final request compiler owns the complete wire and model token limits.
     """
+    verified_sources = {} if verified_sources is None else verified_sources
     if not _scientific_memory_enabled(camp):
         return _legacy_recall_observations(camp, question, recent=recent, relevant=relevant,
-            char_cap=char_cap, token_cap=token_cap, context=context, retrieval_out=retrieval_out)
+            char_cap=char_cap, token_cap=token_cap, context=context, retrieval_out=retrieval_out,
+            verified_sources=verified_sources)
     from .semantic_memory import retrieve, embedding_health, planner_knowledge_delivery, record_delivery_report
-    from .context.retrieval import prepare_query
     from .memory_delivery import project_memory_card, select_memory_cards
 
-    store = ExperimentObservationStore(camp)
+    store = ExperimentObservationStore(camp, verified_sources=verified_sources)
     current_id = (context or {}).get("terminal_observation_id")
     current = store.records(limit=1, observation_id=current_id, context=context)
     if current_id and not current:
         raise ObservationDeliveryRequired(NeedsContext(({"observation_id": current_id,
             "status": "current_observation_unreadable"},), (), "current_observation_unreadable"))
     config = memory_config(camp)
+    target_ids = {(row["body"].get("identity") or {}).get("candidate_id") for row in current}
+    target_ids.discard(None)
+    diagnostic_records = []
+    if target_ids and relevant > 0:
+        candidates = store.search_records(context=context, diagnostic_candidates=sorted(target_ids))
+        available = {row["record_id"]: row for row in current}
+        for selected in related_diagnostic_records(candidates, target_ids, context=context,
+                known_observations=[row["body"] for row in current])[:min(max(relevant, 0), 5)]:
+            identity = selected["record_id"]
+            rows = [available[identity]] if identity in available else store.records(
+                limit=1, observation_id=identity, context=context)
+            if rows:
+                diagnostic_records.append(rows[0])
+    already_delivered_ids = {row["record_id"] for row in current + diagnostic_records}
     health = {"backend": "recent_only", "degraded": False,
         "reason": "similarity_not_requested" if config.enabled else "disabled",
         "model": config.model_id, "revision": config.model_revision, "fingerprint": None,
@@ -1044,12 +1341,15 @@ def recall_observations(camp: Path, question: str, *, recent=2, relevant=4, char
     knowledge = {"status": "disabled", "items": []}
     rank_by_id = {}
     if config.enabled and relevant > 0:
-        query = prepare_query(question=question, identities=[(context or {}).get("candidate_id")])["text"]
+        query = question
         # Independent type allocations prevent a run of experiment hits from
         # excluding every useful lesson before the shared content selection.
         bundle = retrieve(camp, query, config=config, role="research_planner", context=context,
-                          record_types=frozenset({"experiment_observation"}))
-        knowledge_bundle = retrieve(camp, query, config=config, role="research_planner", context=context,
+                          record_types=frozenset({"experiment_observation"}), verified_sources=verified_sources,
+                          exclude_record_ids=already_delivered_ids)
+        prepared_query = ({"text": bundle["query"], "metadata": bundle["query_representation"]}
+                          if "query_representation" in bundle else query)
+        knowledge_bundle = retrieve(camp, prepared_query, config=config, role="research_planner", context=context,
                                     record_types=frozenset({"lesson", "knowledge"}))
         health = embedding_health(bundle)
         health.update(knowledge_indexing=knowledge_bundle.get("indexing"),
@@ -1064,7 +1364,7 @@ def recall_observations(camp: Path, question: str, *, recent=2, relevant=4, char
                     "embedding_retrieval_unavailable", {}, {"paid_maintenance_calls": 0}))
             for item in candidate.get("items", []):
                 rank_by_id[(item["record_type"], item["record_id"])] = item
-        related_observations = bundle.get("items", [])[:min(max(relevant, 0), 5)]
+        related_observations = bundle.get("items", [])
         knowledge = planner_knowledge_delivery(camp, knowledge_bundle, context=context)
         knowledge_cards = knowledge.get("items", [])
 
@@ -1109,7 +1409,9 @@ def recall_observations(camp: Path, question: str, *, recent=2, relevant=4, char
 
     ordered = [card for record in current
                if (card := observation_card(record)) is not None]
+    ordered.extend(card for record in diagnostic_records if (card := observation_card(record)) is not None)
     related = [card for record in related_observations if (card := observation_card(record)) is not None]
+    related = sorted(related, key=related_order)[:min(max(relevant, 0), 5)]
     related.extend(project_memory_card(card, role="research_planner", context=context) for card in knowledge_cards)
     ordered.extend(sorted(related, key=related_order))
     selected = select_memory_cards(ordered, content_chars_budget=config.content_chars_budget,
@@ -1126,8 +1428,12 @@ def recall_observations(camp: Path, question: str, *, recent=2, relevant=4, char
     if retrieval_out is not None:
         retrieval_out.update(selected_knowledge=selected_knowledge, selection_report=selected.report,
                              selection_report_ref=report_ref)
+    overflow_ids = {row["record_id"] for row in selected.report["omitted"]
+                    if row["record_type"] == "experiment_observation"
+                    and row["reason"] == "per_observation_tokens_budget"}
     return {"status": "ready", "cards": observation_cards,
-        "history_index": store.history_index(),
+        "history_index": store.history_index(detailed_ids=[card["record_id"] for card in observation_cards],
+            summary_records=[card["body"] for card in ordered if card["record_id"] in overflow_ids]),
         "current_observation_id": current_id, "retrieval_health": health,
         "omitted_history_count": sum(row.get("record_type") == "experiment_observation"
                                      for row in selected.report["omitted"]),
@@ -1180,16 +1486,22 @@ def _cost_view(costs) -> tuple[Any, dict]:
 
 
 def compact_planner_view(camp: Path, fullobs: dict, *, char_cap=16000, token_cap=16000,
-                         context: dict | None = None) -> dict:
+                         context: dict | None = None, verified_sources: dict | None = None) -> dict:
     if not single_plan_enabled(camp):
         return copy.deepcopy(fullobs)
+    if (fullobs.get("context_delivery_version") == "observation_card_first.v1"
+            and _scientific_memory_enabled(camp) and fullobs.get("memory_delivery_report")):
+        # The scientific selection is already frozen. Even preparing its query
+        # would reopen the current card without using that query afterwards.
+        return copy.deepcopy(fullobs)
     from .semantic_memory import planner_query, planner_knowledge_delivery
+    verified_sources = {} if verified_sources is None else verified_sources
     conditions = {**planner_applicability_context(camp, fullobs), **(context or {})}
-    question = planner_query(camp, fullobs)
+    question = planner_query(camp, fullobs, verified_sources=verified_sources)
     def attach_retrieval(result):
         bundle = {}
         recalled = recall_observations(camp, question, context=conditions,
-            char_cap=char_cap, token_cap=token_cap, retrieval_out=bundle)
+            char_cap=char_cap, token_cap=token_cap, retrieval_out=bundle, verified_sources=verified_sources)
         result["memory_retrieval_health"] = recalled.pop("retrieval_health")
         result["experiment_observations"] = recalled
         if "selected_knowledge" in bundle:
@@ -1214,10 +1526,6 @@ def compact_planner_view(camp: Path, fullobs: dict, *, char_cap=16000, token_cap
         result["history_navigation"] = navigation
         return result
     if fullobs.get("context_delivery_version") == "observation_card_first.v1":
-        if _scientific_memory_enabled(camp) and fullobs.get("memory_delivery_report"):
-            # A frozen scientific selection is already complete. The compiler
-            # can measure the same science without reretrieving or dropping it.
-            return copy.deepcopy(fullobs)
         # Recheck the actual request's budget without recapturing projections
         # as new authoritative heads for their original history sources.
         result = copy.deepcopy(fullobs)

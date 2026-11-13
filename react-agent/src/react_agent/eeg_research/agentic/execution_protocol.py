@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import copy
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -237,6 +238,48 @@ def load_protocol(camp: Path) -> dict[str, Any] | None:
     return payload
 
 
+def training_recipe(protocol: dict[str, Any]) -> dict[str, Any]:
+    """The four candidate-owned training values, resolved from a protocol."""
+    from .schemas import TrainingRecipe
+
+    return TrainingRecipe.model_validate({
+        "epochs": protocol["full_epochs"], "lr": protocol["lr"],
+        "batch_size": protocol["batch_size"], "weight_decay": _weight_decay(protocol),
+    }).model_dump()
+
+
+def with_training_recipe(protocol: dict[str, Any], recipe: dict[str, Any]) -> dict[str, Any]:
+    """Derive one method's execution without changing its evaluation population.
+
+    The approved contract already validates the complete recipe. This adapter
+    only materializes it; every fold and the engineering probe use this path.
+    """
+    result = copy.deepcopy(protocol)
+    result.update(full_epochs=recipe["epochs"], lr=recipe["lr"],
+                  batch_size=recipe["batch_size"], weight_decay=recipe["weight_decay"])
+    overrides = result.setdefault("fidelity_overrides", {})
+    overrides["full"] = {**overrides.get("full", {}), "epochs": recipe["epochs"]}
+    result["fingerprint"] = _fingerprint({key: value for key, value in result.items() if key != "fingerprint"})
+    return result
+
+
+def evaluation_comparison_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Keep evaluation/data policy while allowing declared training changes.
+
+    Exact run reuse still uses the complete protocol and method identities.
+    This projection is only for comparing scientifically different methods.
+    """
+    method_keys = {"epochs", "full_epochs", "lr", "batch_size", "weight_decay", "training"}
+    dispatch_keys = {"fingerprint", "method_suite_id", "method_suite_ref", "method_revision", "fold_id", "benchmark_subject"}
+    result = {key: copy.deepcopy(value) for key, value in config.items() if key not in method_keys | dispatch_keys}
+    if "fidelity_overrides" in result:
+        result["fidelity_overrides"] = {
+            name: {key: value for key, value in settings.items() if key != "epochs"}
+            for name, settings in result["fidelity_overrides"].items()
+        }
+    return result
+
+
 def _weight_decay(protocol: dict[str, Any]) -> float:
     raw = protocol.get("weight_decay")
     if raw is None:
@@ -410,11 +453,11 @@ def command_matches(
 
 
 def _lr_flag(value: float) -> str:
-    return f"{float(value):.8g}"
+    return repr(float(value))
 
 
 def _wd_flag(value: float) -> str:
-    return f"{float(value):.8g}"
+    return repr(float(value))
 
 
 def next_unused_training_seed(protocol: dict[str, Any], used: set[int]) -> int | None:

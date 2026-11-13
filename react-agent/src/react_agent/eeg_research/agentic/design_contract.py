@@ -1,7 +1,7 @@
 """Small scientific brief -> existing executable experiment contract.
 
-Only this native adapter resolves inherited configs. The trainer continues to
-consume model/objective/transform through its existing approved binding path.
+This native adapter resolves inherited configs. Candidate hooks consume
+model/objective/transform; training settings enter the native execution recipe.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from typing import Any, Mapping
 
 from pydantic import ValidationError
 
-from .schemas import DesignerBrief
+from .schemas import DesignerBrief, TrainingRecipe
 
 SECTIONS = ("model", "objective", "transform")
 HOOKS = {"model": "build_encoder", "objective": "build_training_objective",
@@ -51,18 +51,28 @@ def design_contract_version(value: Mapping | Path | str | None) -> str:
 def _validate_parameter_values(parameters: dict, configs: dict) -> None:
     """Scientific parameters may live in source, but repeated config values agree."""
     for name, value in parameters.items():
-        if name in SECTIONS and isinstance(value, dict):
+        if name in configs and isinstance(value, dict):
             for key, declared in value.items():
                 if key not in configs[name] or configs[name][key] != declared:
                     raise DesignContractError("scientific_parameter_config_mismatch:" + name + "." + key)
-        elif "." in name and name.split(".", 1)[0] in SECTIONS:
+        elif "." in name and name.split(".", 1)[0] in configs:
             section, key = name.split(".", 1)
             if key not in configs[section] or configs[section][key] != value:
                 raise DesignContractError("scientific_parameter_config_mismatch:" + name)
         else:
-            for section in SECTIONS:
+            for section in configs:
                 if name in configs[section] and configs[section][name] != value:
                     raise DesignContractError("scientific_parameter_config_mismatch:" + section + "." + name)
+
+
+def is_training_only_change(brief: dict[str, Any]) -> bool:
+    """A recipe-only intervention needs Measurement, not invented source work."""
+    if not isinstance(brief, dict):
+        return False
+    changes, training = brief.get("hook_changes"), brief.get("training_change")
+    return (isinstance(changes, dict) and isinstance(training, dict) and training.get("mode") == "replace"
+            and all(isinstance(changes.get(section), dict) and changes[section].get("mode") == "inherit"
+                    for section in SECTIONS))
 
 
 def materialize_design_brief(brief: dict[str, Any] | DesignerBrief,
@@ -81,8 +91,11 @@ def materialize_design_brief(brief: dict[str, Any] | DesignerBrief,
     task = selected_task if isinstance(selected_task, dict) else {}
     proposal = task.get("proposal") if isinstance(task.get("proposal"), dict) else task
     parent = parent_config if isinstance(parent_config, dict) else {}
-    parent_id = str(task.get("parent_candidate_id") or proposal.get("parent_candidate_id")
+    selected_parent = proposal.get("parent_ref")
+    parent_id = str(task.get("parent_candidate_id") or proposal.get("parent_candidate_id") or selected_parent
                     or parent.get("target_id") or "baseline")
+    if selected_parent is not None and selected_parent != parent_id:
+        raise DesignContractError("selected_parent_binding_mismatch")
     if parent_id != "baseline" and not all(isinstance(parent.get(section), dict) for section in SECTIONS):
         raise DesignContractError("parent_hook_config_missing")
     if parent.get("target_id") and parent["target_id"] != parent_id:
@@ -97,6 +110,19 @@ def materialize_design_brief(brief: dict[str, Any] | DesignerBrief,
         configs[section] = copy.deepcopy(inherited if change.mode == "inherit" else change.config)
         if section == "model" or change.mode == "replace":
             capabilities.append(HOOKS[section])
+    training_change = parsed.training_change
+    # Internal callers without a training declaration retain their existing
+    # protocol-owned recipe. The API contract always supplies training_change.
+    if "training_change" in parsed.model_fields_set or "training" in parent:
+        if training_change.mode == "replace":
+            configs["training"] = training_change.config.model_dump()
+        else:
+            if not isinstance(parent.get("training"), dict):
+                raise DesignContractError("parent_training_config_missing")
+            try:
+                configs["training"] = TrainingRecipe.model_validate(parent["training"]).model_dump()
+            except ValidationError as exc:
+                raise DesignContractError("parent_training_config_invalid") from exc
     _validate_parameter_values(parsed.scientific_parameters, configs)
     scope = copy.deepcopy(proposal.get("evaluation_scope") or task.get("evaluation_scope") or {})
     fidelity = task.get("initial_fidelity") or proposal.get("initial_fidelity")
@@ -128,7 +154,8 @@ def materialize_design_brief(brief: dict[str, Any] | DesignerBrief,
         "inheritance": {
             "parent_candidate_id": parent_id,
             **{key: parent.get(key) for key in ("spec_ref", "spec_hash", "source_hash") if parent.get(key)},
-            "sections": [section for section in SECTIONS if getattr(parsed.hook_changes, section).mode == "inherit"],
+            "sections": ([section for section in SECTIONS if getattr(parsed.hook_changes, section).mode == "inherit"]
+                         + (["training"] if "training" in configs and training_change.mode == "inherit" else [])),
         },
         "status": "draft",
     }
@@ -155,6 +182,8 @@ def scientific_design_projection(spec: dict[str, Any] | None) -> dict[str, Any]:
         "principal_intervention", "hypothesis", "scientific_parameters", "scientific_intent",
         "model", "objective", "transform", "hook_modes", "negative_sampling_policy", "parent_candidate_id",
         "control_candidate_id", "initial_fidelity", "evaluation_scope")}
+    if "training" in spec:
+        result["training"] = copy.deepcopy(spec["training"])
     roster, scientific = [], []
     for requirement in spec.get("implementation_requirements") or []:
         scope = requirement.get("scope", "scientific")

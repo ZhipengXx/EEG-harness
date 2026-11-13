@@ -98,34 +98,55 @@ def fixed_bank_accuracy(
     }
 
 
-def fixed_bank_hits(query, bank, labels) -> tuple[int, int]:
+def fixed_bank_hits(query, bank, labels, *, capture: dict | None = None) -> tuple[int, int]:
     """Top-1 and top-5 hits for one batch of tensors against the whole bank."""
     from torch.nn import functional as F
 
     q = F.normalize(query.float(), dim=-1)
     b = F.normalize(bank.float().to(q.device), dim=-1)
     target = labels.to(q.device).long()
-    top = (q @ b.T).topk(min(5, b.shape[0]), dim=-1).indices
+    scores = q @ b.T
+    top = scores.topk(min(5, b.shape[0]), dim=-1).indices
     hits1 = int((top[:, 0] == target).sum().item())
     hits5 = int((top == target[:, None]).any(dim=-1).sum().item())
+    if capture is not None:
+        positive = scores.gather(1, target[:, None]).squeeze(1)
+        negatives = scores.clone()
+        negatives.scatter_(1, target[:, None], float("-inf"))
+        best_negative = negatives.max(dim=1).values
+        rank_min = (scores > positive[:, None]).sum(dim=1) + 1
+        rank_max = (scores >= positive[:, None]).sum(dim=1)
+        rows = capture.setdefault("queries", [])
+        offset = len(rows)
+        for i, (label, ranked, pos, neg, lo, hi) in enumerate(zip(
+                target.tolist(), top.tolist(), positive.tolist(), best_negative.tolist(),
+                rank_min.tolist(), rank_max.tolist())):
+            rows.append({"query_index": offset + i, "positive_index": label,
+                "top_indices": ranked, "top1_hit": ranked[0] == label,
+                "top5_hit": label in ranked, "positive_score": pos,
+                "best_negative_score": neg if math.isfinite(neg) else None,
+                "margin": pos - neg if math.isfinite(neg) else None,
+                "positive_rank_interval": [lo, hi]})
+        capture.setdefault("embeddings", []).extend(query.detach().float().cpu().tolist())
     return hits1, hits5
 
 
 class FixedBankTally:
     """Sum hits over validation batches. The bank stays the same for every batch."""
 
-    def __init__(self, bank, labels) -> None:
+    def __init__(self, bank, labels, *, capture: dict | None = None) -> None:
         self.bank = bank
         self.labels = labels
         self.offset = 0
         self.hits1 = 0
         self.hits5 = 0
+        self.capture = capture
 
     def add(self, query) -> None:
         count = int(query.shape[0])
         batch = self.labels[self.offset : self.offset + count]
         self.offset += count
-        hits1, hits5 = fixed_bank_hits(query, self.bank, batch)
+        hits1, hits5 = fixed_bank_hits(query, self.bank, batch, capture=self.capture)
         self.hits1 += hits1
         self.hits5 += hits5
 

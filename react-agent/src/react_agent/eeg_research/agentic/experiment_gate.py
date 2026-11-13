@@ -166,6 +166,7 @@ def _execution_hash(spec: dict[str, Any]) -> str:
             "model",
             "objective",
             "transform",
+            "training",
             "intervention",
             "principal_intervention",
             "negative_sampling_policy",
@@ -353,7 +354,12 @@ def approve_experiment(
     draft_problem = executable_draft_problem(copied)
     evaluation = (context or {}).get("evaluation_contract") or {}
     mode = (context or {}).get("evaluation_mode") or evaluation.get("evaluation_mode")
-    if mode == "loso_method_search" and not any(
+    from .design_contract import is_training_only_change
+    training_only = (copied.get("design_contract_version") == "v2"
+                     and is_training_only_change(copied.get("design_brief") or {})
+                     and all((copied.get("hook_modes") or {}).get(section) == "inherit"
+                             for section in ("model", "objective", "transform")))
+    if mode == "loso_method_search" and not training_only and not any(
         item.get("kind", "implementation") == "implementation" and item.get("core", True)
         for item in copied.get("implementation_requirements") or []
     ):

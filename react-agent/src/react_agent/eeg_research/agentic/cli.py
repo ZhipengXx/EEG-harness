@@ -13,7 +13,6 @@ from react_agent.eeg_research.agentic.execution_protocol import ProtocolError, b
 from react_agent.eeg_research.agentic.jobs import worker_disconnected
 from react_agent.eeg_research.agentic.loop import (
     DEFAULT_MAX_GPU_SECONDS,
-    align_interrupt,
     create_campaign,
     event,
     load_state,
@@ -21,6 +20,7 @@ from react_agent.eeg_research.agentic.loop import (
     save_state,
 )
 from react_agent.eeg_research.agentic.schemas import GoalSpec
+from react_agent.eeg_research.agentic.role_config import PLANNING_TIMEOUT_S
 from react_agent.eeg_training.protocol import parse_subject_selection
 
 DEFAULT_ROOT = Path(__file__).resolve().parents[4] / "runs" / "eeg_research_v18"
@@ -134,15 +134,15 @@ def goal(campaign: str, design=None) -> dict:
         "planner_mode": "compare_options",
         "research_execution": {"version": "single_plan_v1", "budget": {"envelopes": {
             kind: {"training_jobs": 2, "gpu_seconds": 2 * gpu / 20,
-                "allocation_basis": "authorized_global_gpu_seconds_per_training_job",
-                "authority": "maximum_runtime_allocation_not_cost_estimate"}
+                "allocation_basis": "rough_global_gpu_seconds_per_training_job",
+                "authority": "planning_forecast_only"}
             for kind in ("new_method", "validation", "confirmation")}}},
         "objective": "改进指定数据与协议下的 EEG 到图像检索",
         "role_models": {
             "research_planner": {"model": "deepseek-v4-pro", "thinking": True,
-                "reasoning_effort": "high", "max_tokens": 32768, "timeout_s": 240},
+                "reasoning_effort": "high", "max_tokens": 32768, "timeout_s": PLANNING_TIMEOUT_S},
             "research_critic": {"model": "deepseek-v4-pro", "thinking": True,
-                "reasoning_effort": "high", "max_tokens": 16384, "timeout_s": 240},
+                "reasoning_effort": "high", "max_tokens": 16384, "timeout_s": PLANNING_TIMEOUT_S},
             "candidate_coder": {"model": "deepseek-flash", "thinking": True,
                 "reasoning_effort": "high", "max_tokens": 262144, "timeout_s": 2400},
             "candidate_reviewer": {"model": "deepseek-flash", "thinking": True,
@@ -159,7 +159,7 @@ def goal(campaign: str, design=None) -> dict:
         "max_gpu_seconds": gpu,
         "max_concurrent_training_jobs": 1,
         "max_api_usd": None,
-        "allowed_changes": ["eeg_encoder", "temporal_pooling", "projection_head", "training_loss", "training_only_augmentation"],
+        "allowed_changes": ["eeg_encoder", "temporal_pooling", "projection_head", "training_loss", "training_only_augmentation", "training_recipe"],
         "frozen_components": ["split_manifest", "query_gallery_manifest", "evaluator", "metric_definition", "image_feature_target"],
     }
 
@@ -186,8 +186,8 @@ def _execution_goal(submitted: dict, execution_version: str | None) -> dict:
         envelopes = dict(budget.get("envelopes") or {})
         for kind in ("new_method", "validation", "confirmation"):
             envelopes.setdefault(kind, {"training_jobs": 2, "gpu_seconds": 2 * gpu_seconds / jobs,
-                "allocation_basis": "authorized_global_gpu_seconds_per_training_job",
-                "authority": "maximum_runtime_allocation_not_cost_estimate"})
+                "allocation_basis": "rough_global_gpu_seconds_per_training_job",
+                "authority": "planning_forecast_only"})
         budget["envelopes"] = envelopes
         submitted["research_execution"] = {**execution, "budget": budget}
     return submitted
@@ -615,12 +615,12 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     inherited = verified_history(args.inherit_study, additional_authorization=additional)
                 submitted = derive_limits(submitted, inherited)
-                estimate, estimate_basis = estimate_suite(inherited, len(selected_gpus))
+                estimate, estimate_basis = estimate_suite(inherited, len(selected_gpus), target_epochs=design.epochs)
             except (OSError, ValueError, KeyError) as exc:
                 print(json.dumps({"error": str(exc)}, ensure_ascii=False))
                 return 2
             submitted["method_suite_gpu_seconds_estimate"] = max(estimate, submitted.get("method_suite_gpu_seconds_estimate") or 0)
-            design = replace(design, subject=",".join(SUBJECTS[:-1]), epochs=50, stop="single_full", seed=0,
+            design = replace(design, subject=",".join(SUBJECTS[:-1]), stop="single_full", seed=0,
                              data_root=str(base.resolve()), evaluation_mode="loso_method_search",
                              checkpoint_policy=submitted["checkpoint_policy"], selection_min_delta=submitted["selection_min_delta"])
         elif args.inherit_study is not None or args.fresh_budget_authorization:
@@ -891,9 +891,6 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"status": "worker_already_running", "pid": pid}, ensure_ascii=False))
             return 0
         request_control(camp, "resume")
-        from react_agent.eeg_research.agentic.verification_cache import verification_scope
-        with verification_scope():
-            align_interrupt(camp)
         state = load_state(camp)
         failure = state.get("failure") if isinstance(state.get("failure"), dict) else {}
         if args.command == "resume" and state.get("status") == "blocked" and failure.get("recoverable") is False:

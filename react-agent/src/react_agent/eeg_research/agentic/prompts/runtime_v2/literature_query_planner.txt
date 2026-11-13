@@ -1,0 +1,5 @@
+Create one to three complementary academic search queries for the supplied research_question, task_setting and evaluation_protocol. Use terminology that helps find original papers about the task, generalization setting, methods and training evidence. The current protocol guides relevance; it need not match every detail of a paper for the paper to be useful.
+
+Give the queries distinct scientific angles relevant to this goal, such as method families, generalization mechanisms, or training and ablation evidence. Choose the angles for this task rather than repeating the same search with synonyms.
+
+Return only the JSON described by OUTPUT_SCHEMA. Queries are search strings, not research recommendations or summaries of papers you have not read.

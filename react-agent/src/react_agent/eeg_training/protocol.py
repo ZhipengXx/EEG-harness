@@ -185,8 +185,6 @@ def validate_design(design: Design) -> None:
             raise SplitError("method_search_requires_eeg_pooled_inter")
         if design.checkpoint_policy != "strict_best" or design.stop != "single_full":
             raise SplitError("method_search_requires_strict_best_single_full")
-        if design.epochs != 50:
-            raise SplitError("method_search_requires_50_epochs")
         chosen = design.subject.split(",")
         if len(chosen) != 9 or not set(chosen) < set(EEG_SUBJECTS) or design.train_dir or design.test_dir:
             raise SplitError("method_search_requires_nine_explicit_training_subjects")
@@ -552,7 +550,7 @@ def train_command(design: Design, out_dir: Path, root: Path | None = None) -> li
         "--batch-size",
         str(design.batch_size),
         "--lr",
-        f"{learning_rate(design):.8g}",
+        repr(float(learning_rate(design))),
         "--data-root",
         str(base),
         "--out",
@@ -560,7 +558,7 @@ def train_command(design: Design, out_dir: Path, root: Path | None = None) -> li
         "--stop",
         design.stop,
         "--weight-decay",
-        f"{design.weight_decay:.8g}",
+        repr(float(design.weight_decay)),
     ]
     if design.test_only:
         command.append("--test-only")

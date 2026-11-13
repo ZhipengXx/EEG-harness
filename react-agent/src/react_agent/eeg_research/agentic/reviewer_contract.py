@@ -408,6 +408,13 @@ def validate_reviewer_reply(raw: Any, context: dict, delivered: dict | None = No
     except ValidationError as exc:
         errors.extend(_error(error["type"], ["summary_zh", *error["loc"]], error["msg"]) for error in exc.errors())
         summary_zh = ""
+    approved = context.get("approved_design") or {}
+    hooks = approved.get("hooks") or {}
+    # Training is applied by the native caller, so unchanged hooks cannot prove
+    # its recipe. Keep all source requirements/issue resolutions candidate-bound.
+    training_only = (isinstance(approved.get("training"), dict) and bool(approved["training"])
+                     and all((hooks.get(name) or {}).get("mode") == "inherit" for name in ("model", "objective", "transform"))
+                     and not any(target["kind"] == "requirement" for target in context["roster"].values()))
     resolved_rows = {}
     for ref, row in parsed_rows.items():
         refs = []
@@ -419,14 +426,18 @@ def validate_reviewer_reply(raw: Any, context: dict, delivered: dict | None = No
                 refs.append(resolved)
         resolved_rows[ref] = refs
         target = context["roster"][ref]
-        code_evidence = any(item["kind"] == "source" and item["alias"] == "candidate" for item in refs)
+        runtime_intervention = training_only and ref == "r0" and target["kind"] == "intervention"
+        code_evidence = any(item["kind"] == "source" and (item["alias"] == "candidate"
+                            or runtime_intervention and item["alias"] == "runtime_train")
+                            for item in refs)
         if row["status"] in {"implemented", "contradicted"} and not refs:
             errors.append(_error("review_evidence_missing", ["assessments", ref, "evidence_refs"], "A definite judgment requires delivered evidence; unverified may use []."))
         needs_candidate = (target["kind"] in {"intervention", "requirement"}
                            or target["kind"] == "issue_resolution" and (target.get("issue") or {}).get("kind") in {"code_error", "design_conflict"})
         if (needs_candidate and row["status"] in {"implemented", "contradicted"}
                 and not code_evidence and not (row["status"] == "contradicted" and _direct_counterexample(target, refs, context))):
-            errors.append(_error("review_code_evidence_missing", ["assessments", ref, "evidence_refs"], "Cite the actual candidate implementation; a passing check alone does not establish code semantics."))
+            source_hint = "candidate implementation or delivered runtime_train caller" if runtime_intervention else "candidate implementation"
+            errors.append(_error("review_code_evidence_missing", ["assessments", ref, "evidence_refs"], f"Cite the actual {source_hint}; a passing check alone does not establish code semantics."))
     previous_updates = set()
     for index, issue in parsed_issues:
         loc = ["issues", index]

@@ -87,14 +87,35 @@ def scalar_loss(loss: Any) -> Any:
     return loss
 
 
-def compute_objective(objective: Any, eeg_z, img_z, scale, positives: list[str] | None = None):
-    """Return a finite scalar loss. An internal TypeError is not retried without positives."""
+def compute_objective(objective: Any, eeg_z, img_z, scale, positives: list[str] | None = None,
+                      *, return_terms: bool = False, return_diagnostics: bool = False):
+    """Run once; optional named, weighted loss contributions are logging tensors.
+
+    Objectives return a scalar Tensor or {"loss": Tensor, "loss_terms": {name:
+    scalar Tensor}}. Terms stay on the loss device with stable names across
+    replicas, including zero terms for short batches. Only the total loss is
+    differentiated; ordinary callers continue to receive that scalar. Optional
+    ``diagnostics`` are named scalar Tensors from this same objective evaluation;
+    they are sampled independently of weighted loss contributions.
+    """
     counters = getattr(objective, "_call_counts", None)
     if isinstance(counters, dict):
         counters["objective_train_calls"] = int(counters.get("objective_train_calls") or 0) + 1
-    if not is_custom_objective(objective):
-        return contrastive_loss(eeg_z, img_z, scale)
-    return objective(eeg_z, img_z, scale, positives)
+    custom = is_custom_objective(objective)
+    result = (contrastive_loss(eeg_z, img_z, scale) if not custom
+              else objective(eeg_z, img_z, scale, positives))
+    loss = result["loss"] if isinstance(result, dict) else result
+    if not return_terms and not return_diagnostics:
+        return loss
+    terms = result.get("loss_terms", {}) if isinstance(result, dict) else {}
+    terms = {name: scalar_loss(value).detach() for name, value in terms.items()}
+    if return_diagnostics:
+        diagnostics = (result.get("diagnostics", {}) if isinstance(result, dict) else {}) if custom else {
+            "effective_scale": scale, "temperature": scale.reciprocal()}
+        # A returned Parameter may share storage with an optimizer parameter.
+        # Snapshot its forward-time value before the subsequent optimizer step.
+        return loss, terms, {name: scalar_loss(value).detach().clone() for name, value in diagnostics.items()}
+    return loss, terms
 
 
 def capabilities_used_payload(

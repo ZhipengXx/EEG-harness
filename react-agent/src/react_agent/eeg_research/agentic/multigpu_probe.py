@@ -1,4 +1,4 @@
-"""Synthetic engineering check using the production DataParallel retrieval step."""
+"""Synthetic engineering check using the production single-/multi-GPU retrieval step."""
 from __future__ import annotations
 
 import argparse
@@ -22,11 +22,11 @@ def run(request: dict) -> dict:
     from react_agent.eeg_training.inference_consistency import persistent_buffers_digest, tensor_digest
     from react_agent.eeg_training.model import contrastive_loss
     from react_agent.eeg_training.train_entry import (
-        _build_hook, _replica_device_probe, placed_retrieval, unique_trainable_parameters,
+        _build_hook, _objective_sample, _replica_device_probe, placed_retrieval, unique_trainable_parameters,
     )
     random.seed(0); np.random.seed(0); torch.manual_seed(0); torch.cuda.manual_seed_all(0)
     cards = request["gpu"]
-    if not torch.cuda.is_available() or torch.cuda.device_count() != len(cards) or len(cards) < 2:
+    if not torch.cuda.is_available() or torch.cuda.device_count() != len(cards) or not cards:
         raise ValueError("multigpu_probe_requires_all_frozen_visible_cards")
     module = importlib.import_module(request["module"])
     candidate = module.EEGCandidate()
@@ -63,10 +63,11 @@ def run(request: dict) -> dict:
         codes = torch.arange(count, device=device) // 2
         targets = torch.randn(int(codes.max()) + 1, 1024, device=device)[codes]
         receipts = []
-        raw = model.module
+        raw = model.module if isinstance(model, torch.nn.DataParallel) else model
         handle = raw.register_forward_hook(_replica_device_probe(receipts))
         try:
-            loss, _top1, _top5 = model(eeg, targets, codes)
+            loss, _top1, _top5, loss_terms, diagnostics = model(eeg, targets, codes, return_loss_terms=True,
+                return_objective_diagnostics=True)
         finally:
             handle.remove()
         loss = scalar_loss(loss.mean())
@@ -84,8 +85,10 @@ def run(request: dict) -> dict:
         if not gradients or any(not bool(torch.isfinite(gradient).all()) for gradient in gradients):
             raise ValueError("multigpu_probe_finite_gradients_required")
         batches.append({"position": label, "total_batch_size": count, "replicas": sorted(receipts, key=lambda row: row["input_device"]),
-            "loss": float(loss.detach()), "gradient_tensor_count": len(gradients)})
-    raw_encoder = model.module.encoder
+            "loss": float(loss.detach()), "gradient_tensor_count": len(gradients),
+            "objective_diagnostics": _objective_sample((1, len(batches), label, count, diagnostics), custom=custom),
+            **({"loss_terms": {name: float(value.mean()) for name, value in loss_terms.items()}} if loss_terms else {})})
+    raw_encoder = (model.module if isinstance(model, torch.nn.DataParallel) else model).encoder
     raw_encoder.eval()
     sample = torch.randn(8, geom["c_num"], length, device=device)
     with torch.no_grad(): expected = raw_encoder(sample)

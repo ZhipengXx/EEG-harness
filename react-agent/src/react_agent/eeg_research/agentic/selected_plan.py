@@ -15,7 +15,7 @@ from typing import Any
 
 from .action_planning import digest
 from .plan_protocol import (config, measurement_action,
-                            pool_summary, proposal_cost, round_id, round_input,
+                            pool_summary, round_id, round_input,
                             scientific_projection, validate_task)
 from .research_execution import single_plan_enabled
 from .schemas import SelectedPlan
@@ -326,10 +326,23 @@ def _native_outcome(before: dict, after: dict) -> dict:
     protected.update(key for key in before.keys() | after.keys() if key.endswith("_reserved"))
     protected.update({"goal_id", "decisions", "selected_plan", "latest_research_round", "budget",
         "budget_owner", "pause_after_step", "last_control_id", "stop_reason", "report_support_status"})
-    return {key: {"before_present": key in before, "before": copy.deepcopy(before.get(key)),
-                  "after_present": key in after, "after": copy.deepcopy(after.get(key))}
-            for key in before.keys() | after.keys() if key not in protected
-            and ((key in before) != (key in after) or before.get(key) != after.get(key))}
+    changes = {}
+    for key in before.keys() | after.keys():
+        if key in protected or ((key in before) == (key in after) and before.get(key) == after.get(key)):
+            continue
+        previous, current = before.get(key), after.get(key)
+        change = {"before_present": key in before, "after_present": key in after}
+        if key == "evidence" and isinstance(previous, list) and isinstance(current, list) and len(current) > len(previous):
+            previous_digest = digest(previous)
+            # Exact serialized identity matters to replay, including numeric types.
+            if digest(current[:len(previous)]) == previous_digest:
+                change["list_append"] = {"before_count": len(previous), "after_count": len(current),
+                    "before_digest": previous_digest, "after_digest": digest(current),
+                    "items": copy.deepcopy(current[len(previous):])}
+                changes[key] = change
+                continue
+        changes[key] = {**change, "before": copy.deepcopy(previous), "after": copy.deepcopy(current)}
+    return changes
 
 
 def _restore_native_outcome(camp: Path, state: dict, record: dict) -> None:
@@ -342,6 +355,22 @@ def _restore_native_outcome(camp: Path, state: dict, record: dict) -> None:
     pending = []
     for key, value in changes.items():
         present, current = key in state, state.get(key)
+        if "list_append" in value:
+            append = value["list_append"]
+            if (key != "evidence" or not isinstance(append, dict) or not isinstance(append.get("items"), list)
+                    or type(append.get("before_count")) is not int or append["before_count"] < 0
+                    or type(append.get("after_count")) is not int
+                    or append["after_count"] != append["before_count"] + len(append["items"])
+                    or value["before_present"] is not True or value["after_present"] is not True
+                    or not isinstance(current, list)):
+                raise ValueError("selected_plan_native_outcome_projection_conflict:" + key)
+            current_digest = digest(current)
+            if present and len(current) == append["after_count"] and current_digest == append["after_digest"]:
+                continue
+            if not present or len(current) != append["before_count"] or current_digest != append["before_digest"]:
+                raise ValueError("selected_plan_native_outcome_projection_conflict:" + key)
+            pending.append((key, {"after_present": True, "after": current + append["items"]}))
+            continue
         if present == value["after_present"] and current == value["after"]:
             continue
         if present != value["before_present"] or current != value["before"]:
@@ -378,30 +407,30 @@ def reflect_control(camp: Path, state: dict) -> None:
                 save_plan(camp, state, plan)
 
 
-def _analysis_ref(state: dict, evidence_id: str | None) -> str | None:
+def _analysis_ref(state: dict, evidence_id: str | None, *, plan_id: str | None = None,
+                  diagnostic_evidence_id: str | None = None) -> str | None:
     return next((row.get("analysis_artifact_id") for row in reversed(state.get("evidence") or [])
                  if row.get("kind") == "analysis" and row.get("status") == "completed"
-                 and row.get("run_evidence_id") == evidence_id), None)
+                 and row.get("run_evidence_id") == evidence_id
+                 and (plan_id is None or row.get("origin_plan_id") == plan_id)
+                 and (diagnostic_evidence_id is None or row.get("diagnostic_evidence_id") == diagnostic_evidence_id)), None)
 
 
 def _measurement(state: dict, plan: dict) -> dict | None:
-    proposal = plan["proposal"]
-    phase = proposal["evaluation_scope"].get("phase")
-    kind = "method_screening" if phase == "screening_2fold" else "method_suite" if (
-        state.get("evaluation_mode") == "loso_method_search") else None
+    """Resolve this task's measurement, preserving an already selected result."""
+    from .stage_contract import measurement_matches_scope
+    scope = plan["proposal"]["evaluation_scope"]
+    evidence_id = plan.get("measurement_evidence_id")
     for row in reversed(state.get("evidence") or []):
+        if evidence_id and row.get("evidence_id") != evidence_id:
+            continue
         if row.get("candidate_id") != plan["candidate_id"] or row.get("evaluation_valid") is not True:
             continue
-        if kind and row.get("kind") != kind:
-            continue
-        if not kind and row.get("fidelity") != ("pilot" if phase == "pilot" else "full"):
+        if not row.get("fidelity") or not measurement_matches_scope(row, scope):
             continue
         if plan.get("source_hash") and row.get("source_hash") != plan["source_hash"]:
             continue
         if plan.get("spec_hash") and row.get("spec_hash") != plan["spec_hash"]:
-            continue
-        declared_seed = proposal["evaluation_scope"].get("seed")
-        if declared_seed is not None and row.get("seed") != declared_seed:
             continue
         return row
     return None
@@ -419,7 +448,8 @@ def _finish(camp: Path, state: dict, plan: dict, status: str, *, detail: str | N
                 "error_fingerprint": digest({"detail": detail, "source_hash": plan.get("source_hash"), "spec_hash": plan.get("spec_hash")}),
                 "repairs_used": plan["repair_count"]}
         card = record_experiment_observation(camp, state, plan, status,
-            analysis_ref=plan.get("analysis_artifact_ref") or _analysis_ref(state, plan.get("measurement_evidence_id")))
+            analysis_ref=plan.get("analysis_artifact_ref") or _analysis_ref(
+                state, plan.get("measurement_evidence_id"), plan_id=plan["plan_id"]))
         plan["terminal_observation_id"] = card["observation_id"]
         plan["terminal_observation_digest"] = card["content_digest"]
         # Publication precedes release/handoff. Restart reuses this exact card.
@@ -482,6 +512,28 @@ def engineering_budget_failure(detail: Any) -> bool:
         "coding_no_progress_exhausted", "engineering_repair_limit", "coding_attempt_limit"))
 
 
+def _detached_implementation_failure(state: dict, plan: dict) -> str | None:
+    """Reuse the native failure after detachment clears active candidate fields."""
+    if plan["current_step"] not in {"implement", "repair"}:
+        return None
+    target = plan.get("candidate_id")
+    receipt = (state.get("detached_candidates") or {}).get(target) or {}
+    failure = receipt.get("candidate_failure") or {}
+    if (not receipt.get("receipt_hash") or receipt.get("candidate_id") != target
+            or failure.get("candidate_id") != target or failure.get("status") != "implementation_failed"):
+        return None
+    # The lifecycle already verified the receipt. Match its consumed decision
+    # to this plan's own implementation intent; no artifact reread is needed.
+    intents = {row.get("decision_id") for row in plan["step_receipts"]
+               if row.get("kind") == "step_intent" and row.get("step") in {"implement", "repair"}}
+    if any(row.get("decision_id") in intents and row.get("decision_id") in receipt.get("decision_ids", [])
+           and row.get("origin_plan_id") == plan["plan_id"]
+           and row.get("detach_receipt") == receipt["receipt_hash"]
+           for row in state.get("decisions") or []):
+        return failure.get("detail") or receipt.get("reason") or "engineering_implementation_failed"
+    return None
+
+
 def finish_bounded_engineering_failure(camp: Path, state: dict, error: Any) -> dict | None:
     plan = load_plan(camp, state)
     if (not plan or plan["current_step"] not in {"design", "implement", "check", "repair", "design_revision"}
@@ -492,7 +544,7 @@ def finish_bounded_engineering_failure(camp: Path, state: dict, error: Any) -> d
 
 def _native_step(camp: Path, state: dict, plan: dict, action: str, services: dict, runner=None, *, raw=None) -> bool:
     """Commit an ordinary native decision and its frozen selected-task intent."""
-    from .loop import (_apply_action, _finish_step, _next_decision_id, _read, _write, observation)
+    from .loop import (_apply_action, _finish_step, _next_decision_id, _read, _write)
     from .artifacts import request_digest
     from .owner_budget import budget_owner
     pending = next((r for r in reversed(plan["step_receipts"]) if r.get("kind") == "step_intent"
@@ -501,6 +553,7 @@ def _native_step(camp: Path, state: dict, plan: dict, action: str, services: dic
                    r.get("intent_receipt_id") == pending["receipt_id"] for r in plan["step_receipts"])
     if complete:
         return True
+    resuming = pending is not None
     if pending:
         from .decision_receipts import read_projected_decision
         body = read_projected_decision(camp, pending["decision_id"])
@@ -539,7 +592,13 @@ def _native_step(camp: Path, state: dict, plan: dict, action: str, services: dic
     if not record.get("executed") and not record.get("consumed"):
         before = copy.deepcopy(state)
         with budget_owner(camp, plan["budget_owner"], purpose="mainline"):
-            _apply_action(camp, state, action, decision, runner, services, observation(camp))
+            completed = services.get("completed_implementation")
+            adopted = (resuming and action in {"implement_candidate", "repair_candidate"} and completed
+                       and completed(camp, state, plan))
+            if not adopted:
+                # Admission applies to work still needing execution; a completed
+                # independent review can settle the original pending step.
+                _apply_action(camp, state, action, decision, runner, services, None)
         _finish_step(camp, state, selected_step_outcome=_native_outcome(before, state))
     elif record.get("executed"):
         _restore_native_outcome(camp, state, record)
@@ -627,7 +686,8 @@ def _select(camp: Path, state: dict, backend, critic=None) -> dict:
     from .research_execution import planning_call_budget
     from .staged_planning_recovery import restore_staged_paid
     recovered = restore_staged_paid(camp.resolve(), state)
-    full = recovered[0] if recovered else observation(camp)
+    verified_sources = None if recovered else {}
+    full = recovered[0] if recovered else observation(camp, verified_sources=verified_sources)
     if not recovered and (camp / "method_search_manifest.json").is_file():
         # Supply actual frozen fold identifiers even on the first round, when
         # neither a previous experiment nor an observation card exists yet.
@@ -663,7 +723,7 @@ def _select(camp: Path, state: dict, backend, critic=None) -> dict:
         if recovered:
             delivered = recovered[3].get("planner_delivery") or compact_planner_view(camp, full)
         else:
-            delivered = compact_planner_view(camp, full)
+            delivered = compact_planner_view(camp, full, verified_sources=verified_sources)
     except ObservationDeliveryRequired as exc:
         from dataclasses import asdict
         # Persist the actual typed obligation before planning owner/API admission.
@@ -686,6 +746,13 @@ def _select(camp: Path, state: dict, backend, critic=None) -> dict:
         event(camp, "planner_context_resolved", round_id=research_round_id,
               input_observation_digest=input_digest)
     if not recovered:
+        # Reuse the current experiment card already read and verified by
+        # compact_planner_view; literature must not repeat its provenance work.
+        from .literature_bootstrap import planning_literature
+        literature = planning_literature(camp, delivered)
+        if literature["status"] != "disabled":
+            full["literature_memory"] = literature
+            delivered["literature_memory"] = literature
         from .planning_context import build_proposer_input
         delivered = build_proposer_input(full, delivered)
     from .context.representations import delivered_source_refs
@@ -756,7 +823,7 @@ def _select(camp: Path, state: dict, backend, critic=None) -> dict:
     proposal = parsed["selected_proposal"]
     plan_id = "plan_" + digest({"round": research_round_id, "proposal": proposal})[:32]
     owner = allocate_selected_plan(camp, plan_id=plan_id, task_kind=proposal["task_kind"],
-        known_cost=proposal_cost(proposal, full)["known"], recovery_limits=limits)
+        recovery_limits=limits)
     plan = SelectedPlan(plan_id=plan_id, originating_round=research_round_id,
         originating_proposal=proposal["proposal_id"], proposal=proposal,
         scientific_intent_digest=digest(proposal["scientific_intent"]), candidate_id=proposal.get("target_candidate_ref"),
@@ -778,7 +845,7 @@ def _select(camp: Path, state: dict, backend, critic=None) -> dict:
 
 def tick_selected_plan(camp: Path, state: dict, backend, services: dict, runner=None) -> dict:
     from .loop import (_launch, _record_job, _sync_ledger, candidate_implementation_target,
-                       load_state, observation, save_state)
+                       load_state, save_state)
     from .owner_budget import budget_owner
     if recover_initial_selection(camp, state):
         return state
@@ -789,7 +856,19 @@ def tick_selected_plan(camp: Path, state: dict, backend, services: dict, runner=
     if plan is None or plan["status"] in TERMINAL:
         if plan and plan.get("terminal_observation_id") and not plan.get("continuation_owner"):
             return _finish(camp, state, plan, plan["status"])
+        from .literature_bootstrap import ensure_literature
+        try:
+            ensure_literature(camp)
+        except (ValueError, OSError, RuntimeError) as exc:
+            from .loop import persist_failure
+            persist_failure(camp, state, phase="literature_bootstrap",
+                error_type=type(exc).__name__, detail=str(exc), recoverable=True)
+            save_state(camp, state)
+            return state
         return _select(camp, state, backend, critic=services.get("critic"))
+    detached_failure = _detached_implementation_failure(state, plan)
+    if detached_failure:
+        return _finish(camp, state, plan, "failed", detail=detached_failure)
     # Resume continues the same identity and accumulated attempts.
     if plan["status"] in {"paused", "blocked"}:
         plan["status"] = "preparing"
@@ -842,7 +921,10 @@ def tick_selected_plan(camp: Path, state: dict, backend, services: dict, runner=
         return state
     if plan["current_step"] == "design":
         intervention = plan["proposal"]["task_description"]
-        draft = {"intervention": intervention, "parent_candidate_id": "baseline",
+        parent = plan["proposal"].get("parent_ref")
+        if not isinstance(parent, str) or not parent.strip():
+            raise ValueError("selected_new_method_parent_missing")
+        draft = {"intervention": intervention, "parent_candidate_id": parent,
                  "control_candidate_id": "baseline", "initial_fidelity": "pilot" if
                     plan["proposal"]["evaluation_scope"].get("phase") == "pilot" else "full"}
         if not _native_step(camp, state, plan, "design_experiment", services, runner, raw={
@@ -902,6 +984,9 @@ def tick_selected_plan(camp: Path, state: dict, backend, services: dict, runner=
         if repair:
             plan["repair_count"] += 1
         plan["attempt"] += 1
+        detached_failure = _detached_implementation_failure(state, plan)
+        if detached_failure:
+            return _finish(camp, state, plan, "failed", detail=detached_failure)
         if state.get("needs_replan"):
             return _finish(camp, state, plan, "needs_replan", detail=str(state["needs_replan"]))
         if state.get("design_revision_task"):
@@ -955,6 +1040,8 @@ def tick_selected_plan(camp: Path, state: dict, backend, services: dict, runner=
             plan.update(measurement_evidence_id=row["evidence_id"], status="collecting_observation", current_step="analyze")
             save_plan(camp, state, plan)
             return state
+        if plan.get("measurement_evidence_id"):
+            return _blocked(camp, state, plan, "selected_plan_verified_measurement_missing")
         failed_measurement = next((r for r in reversed(state.get("evidence") or [])
             if r.get("candidate_id") == plan["candidate_id"] and r.get("fidelity")
             and r.get("evidence_id") not in plan["input_evidence_ids"]
@@ -962,7 +1049,8 @@ def tick_selected_plan(camp: Path, state: dict, backend, services: dict, runner=
         if failed_measurement:
             return _finish(camp, state, plan, "failed", detail="measurement_engineering_failed:" +
                 str(failed_measurement.get("reason") or failed_measurement.get("job_status")))
-        action = measurement_action(plan["proposal"], observation(camp))
+        from .native_authorization import effective_goal
+        action = measurement_action(plan["proposal"], {"goal": effective_goal(camp)})
         if state.get("evaluation_mode") == "loso_method_search" and action == "run_full" and plan["candidate_id"] != "baseline":
             baseline = any(r.get("candidate_id") == "baseline" and r.get("kind") == "method_suite"
                 and r.get("evaluation_valid") for r in state.get("evidence") or [])
@@ -979,18 +1067,31 @@ def tick_selected_plan(camp: Path, state: dict, backend, services: dict, runner=
         save_plan(camp, state, plan)
         return state
     if plan["current_step"] == "diagnose":
-        if not _native_step(camp, state, plan, "collect_diagnostics", services, runner):
+        request = plan["proposal"]["evaluation_scope"].get("diagnostic_request")
+        if not _native_step(camp, state, plan, "collect_diagnostics", services, runner,
+                            raw={"diagnostic_request": request} if request is not None else None):
             reflect_control(camp, state)
             return state
         diagnostic = state.get("last_local_result") or {}
         evidence_id = diagnostic.get("evidence_id") or diagnostic.get("same_as")
         if not evidence_id:
-            evidence_id = next((row.get("evidence_id") for row in reversed(state.get("evidence") or [])
-                if row.get("kind") == "diagnostic_bundle"), None)
+            return _blocked(camp, state, plan, "selected_plan_diagnostic_evidence_missing")
+        # Diagnosis records the diagnostic bundle, while its analysis is bound
+        # to the actual measurement selected by the same resolver as Analyst.
+        measured = _measurement(state, plan)
+        analysis_ref = (_analysis_ref(state, measured["evidence_id"], plan_id=plan["plan_id"], diagnostic_evidence_id=evidence_id)
+                        if measured else None)
+        if measured and not analysis_ref:
+            analyst = services.get("analyze_diagnostics")
+            if analyst is None:
+                return _blocked(camp, state, plan, "selected_plan_analyst_missing")
+            with budget_owner(camp, plan["budget_owner"], purpose="mainline"):
+                analyst(camp, state, diagnostic)
+            analysis_ref = _analysis_ref(state, measured["evidence_id"], plan_id=plan["plan_id"], diagnostic_evidence_id=evidence_id)
+            if not analysis_ref:
+                return _blocked(camp, state, plan, "selected_plan_analysis_incomplete")
+        plan["analysis_artifact_ref"] = analysis_ref
         plan["measurement_evidence_id"] = evidence_id
-        plan["analysis_artifact_ref"] = next((row.get("analysis_artifact_id")
-            for row in reversed(state.get("evidence") or []) if row.get("kind") == "analysis"
-            and row.get("status") == "completed" and row.get("candidate_id") == plan["candidate_id"]), None)
         plan.update(status="collecting_observation", current_step="observation")
         save_plan(camp, state, plan)
         return state
@@ -998,14 +1099,17 @@ def tick_selected_plan(camp: Path, state: dict, backend, services: dict, runner=
         row = _measurement(state, plan)
         if not row:
             return _blocked(camp, state, plan, "selected_plan_verified_measurement_missing")
-        analysis_ref = _analysis_ref(state, row["evidence_id"])
+        if not plan.get("measurement_evidence_id"):
+            plan["measurement_evidence_id"] = row["evidence_id"]
+            save_plan(camp, state, plan)
+        analysis_ref = _analysis_ref(state, row["evidence_id"], plan_id=plan["plan_id"])
         if not analysis_ref:
             analyst = services.get("analyze")
             if analyst is None:
                 return _blocked(camp, state, plan, "selected_plan_analyst_missing")
             with budget_owner(camp, plan["budget_owner"], purpose="mainline"):
                 analyst(camp, state)
-            analysis_ref = _analysis_ref(state, row["evidence_id"])
+            analysis_ref = _analysis_ref(state, row["evidence_id"], plan_id=plan["plan_id"])
             if not analysis_ref:
                 return _blocked(camp, state, plan, "selected_plan_analysis_incomplete")
         plan["analysis_artifact_ref"] = analysis_ref

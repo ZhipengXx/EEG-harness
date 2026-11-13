@@ -5,11 +5,13 @@ checks remain owned by method_suite; phase receipts only authorize missing work.
 """
 from __future__ import annotations
 
+import copy
 import random
 import statistics
 from pathlib import Path
 
 from react_agent.eeg_research.agentic.loso_study import SUBJECTS, folds, identity, read, digest, write_once
+from .comparison import meets_gain_threshold
 
 SCREENING = "screening_2fold"
 CONFIRMATION = "confirmation_10fold"
@@ -71,14 +73,15 @@ def phase_fold_ids(common: dict, phase: str) -> list[str]:
     raise ValueError("method_phase_unknown")
 
 
-def suites_for_target(camp: Path, target: str) -> list[dict]:
+def suites_for_target(camp: Path, target: str, *, state: dict | None = None) -> list[dict]:
     from react_agent.eeg_research.agentic import method_suite as ms
+    detached = ms.completed_detached_suites(camp, state or {}, required_target=target)
     return [ms.validate_suite(camp, path.parent.name) for path in sorted((camp / "suites").glob("*/suite_manifest.json"))
-            if read(path).get("method", {}).get("candidate_id") == target]
+            if path.parent.name not in detached and read(path).get("method", {}).get("candidate_id") == target]
 
 
 def valid_scores(camp: Path, suite: dict, ids: list[str] | None = None, *,
-                 suite_verified: bool = False) -> list[dict]:
+                 suite_verified: bool = False, verified_scores: list[dict] | None = None) -> list[dict]:
     from react_agent.eeg_research.agentic import method_suite as ms
     # This validates real score/freezes/dependencies, not suite_state's counters.
     paths = [(fold, camp / "suites" / suite["suite_id"] / fold["fold_id"] / "benchmark.json")
@@ -90,27 +93,42 @@ def valid_scores(camp: Path, suite: dict, ids: list[str] | None = None, *,
         ms.validate_suite(camp, suite["suite_id"], verify_data=True,
                           fold_ids=[fold["fold_id"] for fold, _path in paths])
     scores = []
+    accepted = {row["fold_id"]: row for row in verified_scores or []}
     for _fold, path in paths:
         score = read(path)
-        ms.verify_score(camp, suite, score)
+        if accepted.get(score["fold_id"]) != score:
+            ms.verify_score(camp, suite, score)
         ms.aggregate_records(suite, [score])
         scores.append(score)
     return scores
 
 
-def phase_cost(common: dict, phase: str, candidate_completed: list[str], baseline_completed: list[str], *, target: str = "candidate") -> dict:
+def phase_fold_work(common: dict, phase: str, candidate_completed: list[str], baseline_completed: list[str], *,
+                    target: str) -> dict:
+    """Select missing scientific work independently of any cost forecast."""
     ids = phase_fold_ids(common, phase)
-    candidate_missing = [] if target == "baseline" else [fold for fold in ids if fold not in candidate_completed]
-    baseline_missing = [fold for fold in ids if fold not in baseline_completed]
+    return {"candidate": [] if target == "baseline" else [fold for fold in ids if fold not in candidate_completed],
+            "baseline": [fold for fold in ids if fold not in baseline_completed]}
+
+
+def phase_cost(common: dict, phase: str, candidate_completed: list[str], baseline_completed: list[str], *,
+               target: str = "candidate", candidate_training: dict | None = None) -> dict:
+    ids = phase_fold_ids(common, phase)
+    work = phase_fold_work(common, phase, candidate_completed, baseline_completed, target=target)
+    candidate_missing, baseline_missing = work["candidate"], work["baseline"]
     jobs = len(candidate_missing) + len(baseline_missing)
     estimate = common.get("gpu_seconds_estimate_per_suite")
     per_fold = estimate / 10 if isinstance(estimate, (int, float)) else None
+    from .method_suite import suite_gpu_estimate
+    candidate_per_fold = suite_gpu_estimate(common, candidate_training) / 10 if per_fold is not None else None
     return {"phase": phase, "missing_candidate_fold_ids": candidate_missing, "missing_baseline_fold_ids": baseline_missing,
             "missing_candidate_folds": len(candidate_missing), "missing_baseline_folds": len(baseline_missing),
             "candidate_reuse_count": 0 if target == "baseline" else len(ids) - len(candidate_missing),
             "baseline_reuse_count": len(ids) - len(baseline_missing), "training_jobs": jobs,
-            "gpu_seconds": jobs * per_fold if per_fold is not None else None,
-            "gpu_estimate_basis": "frozen_suite_estimate_per_fold" if per_fold is not None else "unknown_requires_frozen_estimate",
+            "gpu_seconds": (len(candidate_missing) * candidate_per_fold + len(baseline_missing) * per_fold
+                            if per_fold is not None else None),
+            "gpu_estimate_basis": ("declared_epoch_scaled_suite_estimate" if candidate_training else "frozen_suite_estimate_per_fold")
+                if per_fold is not None else "unknown_requires_frozen_estimate",
             "feedback_report_count": 1 if common.get("research_execution_version") == "single_plan_v1" else
                 1 + int(target != "baseline" and bool(baseline_missing)),
             "conditional_api_review_repair_cost": "unknown_within_existing_authorized_caps",
@@ -125,7 +143,7 @@ def dry_run(common: dict, *, candidate_completed: list[str] | None = None, basel
     selected = common["selection_manifest"]["screening_fold_ids"]
     return {"evaluation_schedule": "screen_then_confirm", "selection_manifest": common["selection_manifest"],
             "screening_folds": [{"fold_id": row["fold_id"], "held_out_subject": row["held_out_subject"],
-                                  "train_subjects": row["train_subjects"], "epochs": 50, "seed": 0, "fidelity": "full"}
+                                  "train_subjects": row["train_subjects"], "epochs": row["protocol"]["full_epochs"], "seed": 0, "fidelity": "full"}
                                  for row in common["folds"] if row["fold_id"] in selected],
             "confirmation_remaining_fold_ids": common["selection_manifest"]["confirmation_fold_ids"],
             "screening_cost": phase_cost(common, SCREENING, candidate_completed, baseline_completed),
@@ -141,7 +159,7 @@ def planner_phase_targets(camp: Path, state: dict) -> dict:
     choices = {"run_screening": [], "run_confirmation": []}
     if common.get("evaluation_schedule") != "screen_then_confirm" or state.get("active_suite"):
         return choices
-    controls = suites_for_target(camp, "baseline")
+    controls = suites_for_target(camp, "baseline", state=state)
     b_done = [row["fold_id"] for row in valid_scores(camp, controls[-1])] if controls else []
     cost = read(camp / "cost.json") if (camp / "cost.json").exists() else {}
     used_jobs = max(state.get("training_jobs", 0), cost.get("training_jobs", 0))
@@ -156,7 +174,7 @@ def planner_phase_targets(camp: Path, state: dict) -> dict:
         if target in state.get("detached_candidates", []):
             continue
         try:
-            candidates = suites_for_target(camp, target)
+            candidates = suites_for_target(camp, target, state=state)
             c_done = [row["fold_id"] for row in valid_scores(camp, candidates[-1])] if candidates else []
             phase = SCREENING
             if target != "baseline" and candidates and (camp / "suites" / candidates[-1]["suite_id"] / "screening.json").exists():
@@ -171,7 +189,8 @@ def planner_phase_targets(camp: Path, state: dict) -> dict:
                 phase = CONFIRMATION
             elif target == "baseline" and set(phase_fold_ids(common, SCREENING)) <= set(b_done):
                 continue
-            estimate = phase_cost(common, phase, c_done, b_done, target=target)
+            training = candidates[-1]["method"]["hook_spec"].get("training") if candidates else ms.training_for_target(camp, target)
+            estimate = phase_cost(common, phase, c_done, b_done, target=target, candidate_training=training)
             if (used_jobs + estimate["training_jobs"] <= state["max_training_jobs"]
                     and float(cost.get("gpu_seconds_used", 0)) + estimate["gpu_seconds"] <= state["max_gpu_seconds"]
                     and calls_left >= feedback_calls * estimate["feedback_report_count"]):
@@ -204,7 +223,9 @@ def screening_result(common: dict, suite: dict, scores: list[dict], baseline_sui
     if suite["method"]["candidate_id"] == "baseline":
         body["screening_result"] = "baseline_reference"
         return body
-    if baseline_suite is None or baseline_suite["method"]["public_recipe"] != suite["method"]["public_recipe"]:
+    from .execution_protocol import evaluation_comparison_config
+    if (baseline_suite is None or evaluation_comparison_config(baseline_suite["method"]["public_recipe"])
+            != evaluation_comparison_config(suite["method"]["public_recipe"])):
         raise ValueError("screening_matched_baseline_recipe_mismatch")
     controls = {row["held_out_subject"]: row for row in control}
     paired = []
@@ -218,7 +239,8 @@ def screening_result(common: dict, suite: dict, scores: list[dict], baseline_sui
     gain = statistics.mean(row["delta_pp"] for row in paired)
     threshold = float((common.get("screening_policy") or {}).get("min_mean_gain_pp", 0.5))
     body.update(paired_scores=paired, screening_mean_delta_pp=gain, min_mean_gain_pp=threshold,
-                screening_result="screening_passed" if gain >= threshold else "not_promoted",
+                training_recipe=suite["method"]["public_recipe"], baseline_training_recipe=baseline_suite["method"]["public_recipe"],
+                screening_result="screening_passed" if meets_gain_threshold(gain, threshold) else "not_promoted",
                 promotion_decision={"reason": "fixed_two_fold_paired_mean_threshold", "threshold_pp": threshold,
                                     "statistical_significance": "not_established"}, baseline_suite_hash=baseline_suite["suite_hash"])
     return body
@@ -276,6 +298,7 @@ def reconcile_api_usage(camp: Path, state: dict, *, block: bool = True) -> dict:
     progress_path = camp / "suites" / suite_id / "suite_state.json" if suite_id else None
     if progress_path and progress_path.exists():
         progress = read(progress_path)
+        saved_progress = copy.deepcopy(progress)
         if waiting:
             if progress.get("scheduling_status") != "awaiting_reconciliation":
                 progress["scheduling_status_before_reconciliation"] = progress.get("scheduling_status")
@@ -283,7 +306,8 @@ def reconcile_api_usage(camp: Path, state: dict, *, block: bool = True) -> dict:
         elif progress.get("scheduling_status") == "awaiting_reconciliation":
             progress["scheduling_status"] = progress.pop("scheduling_status_before_reconciliation", None)
             progress.pop("reconciliation_reason", None)
-        _write(progress_path, progress)
+        if progress != saved_progress:
+            _write(progress_path, progress)
     if waiting and block:
         raise LlmUnavailable(reason, diagnostics=state["awaiting_reconciliation"])
     return cost
@@ -304,8 +328,8 @@ def _phase_projection(camp: Path, common: dict, suite: dict, baseline: dict, rec
     """Display only verified folds completed before this admission's work list.
 
     Newly completed folds in the current phase are not relabelled as cache hits
-    when recovering. The receipt binds the original cost estimate and missing
-    work; checkpoint/source/canonical validation remains in valid_scores.
+    when recovering. The receipt binds the original missing work;
+    checkpoint/source/canonical validation remains in valid_scores.
     """
     request = receipt["request"]
     ids = phase_fold_ids(common, request["phase"])
@@ -316,16 +340,6 @@ def _phase_projection(camp: Path, common: dict, suite: dict, baseline: dict, rec
     reused_ids = [fold for fold in ids if fold not in work and fold in by_fold]
     baseline_by_fold = {row["fold_id"]: row for row in baseline_scores}
     baseline_reused = [fold for fold in ids if fold not in request["fold_work"]["baseline"] and fold in baseline_by_fold]
-    estimate = request.get("phase_cost_estimate")
-    if not isinstance(estimate, dict) or estimate.get("training_jobs") != request["training_jobs"]:
-        # Older receipt representations did not carry the complete display
-        # estimate. Derive a current verified estimate with an explicit label.
-        estimate = phase_cost(common, request["phase"], [row["fold_id"] for row in candidate_scores],
-                              [row["fold_id"] for row in baseline_scores],
-                              target="baseline" if request["candidate_suite_id"] == request["baseline_suite_id"] else "candidate")
-        estimate = {**estimate, "estimate_scope": "current_verified_remaining_score_work"}
-    else:
-        estimate = {**estimate, "estimate_scope": "frozen_admission_estimate_from_verified_fold_records"}
     records = []
     for fold_id in reused_ids:
         score = by_fold[fold_id]
@@ -338,9 +352,9 @@ def _phase_projection(camp: Path, common: dict, suite: dict, baseline: dict, rec
                         "score_sha256": digest(score_path), "method_revision": suite["method"]["method_revision"],
                         "reuse_kind": "verified_completed_full_fold_before_current_admission"})
     return {"reused_fold_ids": reused_ids, "reused_fold_records": records, "baseline_reused_fold_ids": baseline_reused,
-            "phase_cost": {**estimate, "phase_receipt_id": receipt["receipt_id"], "phase_receipt_hash": receipt["request_hash"],
-                           "cost_scope": "paired_candidate_and_baseline_phase", "suite_missing_folds_at_admission": len(work),
-                           "global_actual_cost_ledger": str(camp / "cost.json"), "estimate_is_actual_charge": False}}
+            "phase_work": {"fold_work": request["fold_work"], "phase_receipt_id": receipt["receipt_id"],
+                           "phase_receipt_hash": receipt["request_hash"], "suite_missing_folds_at_admission": len(work),
+                           "global_actual_cost_ledger": str(camp / "cost.json")}}
 
 
 def begin_phase(camp: Path, state: dict, target: str, *, phase: str | None = None) -> str:
@@ -350,30 +364,11 @@ def begin_phase(camp: Path, state: dict, target: str, *, phase: str | None = Non
     common = ms.manifest(camp)
     phase = phase or SCREENING
     _latest_control(camp, state)
-    cost_ledger = reconcile_api_usage(camp, state)
+    reconcile_api_usage(camp, state)
     if state.get("active_suite"):
         raise ValueError("method_suite_already_active")
     if target in state.get("detached_candidates", []):
         raise ValueError("method_target_detached")
-    # Refuse an unaffordable phase before spending on a preparation probe.
-    prior_c = suites_for_target(camp, target)
-    prior_b = suites_for_target(camp, "baseline")
-    completed_c = [row["fold_id"] for row in valid_scores(camp, prior_c[-1])] if prior_c else []
-    completed_b = [row["fold_id"] for row in valid_scores(camp, prior_b[-1])] if prior_b else []
-    preview = phase_cost(common, phase, completed_c, completed_b, target=target)
-    if max(state["training_jobs"], cost_ledger.get("training_jobs", 0)) + preview["training_jobs"] > state["max_training_jobs"]:
-        if phase == CONFIRMATION:
-            _awaiting_admission(camp, prior_c, "phase_training_job_reservation_unavailable")
-        raise ValueError("phase_training_job_reservation_unavailable")
-    if float(cost_ledger.get("gpu_seconds_used", 0)) + preview["gpu_seconds"] > state["max_gpu_seconds"]:
-        if phase == CONFIRMATION:
-            _awaiting_admission(camp, prior_c, "phase_gpu_reservation_unavailable")
-        raise ValueError("phase_gpu_reservation_unavailable")
-    feedback_per_report = int((common.get("confirmation_policy") or {}).get("feedback_llm_calls_reserved", 2))
-    if max(state.get("llm_calls", 0), cost_ledger.get("llm_calls", 0)) + feedback_per_report * preview["feedback_report_count"] > state["max_llm_calls"]:
-        if phase == CONFIRMATION:
-            _awaiting_admission(camp, prior_c, "phase_feedback_api_reservation_unavailable")
-        raise ValueError("phase_feedback_api_reservation_unavailable")
     suite = _prepare(camp, state, target)
     baseline = suite if target == "baseline" else _prepare(camp, state, "baseline")
     c_scores = valid_scores(camp, suite)
@@ -385,14 +380,12 @@ def begin_phase(camp: Path, state: dict, target: str, *, phase: str | None = Non
         result = read_screening(camp, suite["suite_id"])
         if result["screening_result"] != "screening_passed":
             validate_exploration_receipt(camp, suite)
-    cost = phase_cost(common, phase, [row["fold_id"] for row in c_scores], [row["fold_id"] for row in b_scores], target=target)
+    work = phase_fold_work(common, phase, [row["fold_id"] for row in c_scores], [row["fold_id"] for row in b_scores],
+                           target=target)
     request = {"phase": phase, "candidate_suite_id": suite["suite_id"], "baseline_suite_id": baseline["suite_id"],
                "suite_hash": suite["suite_hash"], "method_revision": suite["method"]["method_revision"],
                "baseline_suite_hash": baseline["suite_hash"], "selection_manifest_hash": common["selection_manifest"]["selection_manifest_hash"],
-               "training_jobs": cost["training_jobs"], "gpu_seconds": cost["gpu_seconds"],
-               "llm_calls": feedback_per_report * cost["feedback_report_count"], "feedback_allocation_per_report": feedback_per_report,
-               "phase_cost_estimate": cost,
-               "fold_work": {"candidate": cost["missing_candidate_fold_ids"], "baseline": cost["missing_baseline_fold_ids"]}}
+               "fold_work": work}
     if result is not None and result["screening_result"] != "screening_passed":
         request["exploration_receipt_id"] = validate_exploration_receipt(camp, suite)["receipt_id"]
     path = camp / "suites" / suite["suite_id"] / "suite_state.json"
@@ -408,18 +401,18 @@ def begin_phase(camp: Path, state: dict, target: str, *, phase: str | None = Non
     progress.update(phase=phase, screening_fold_ids=phase_fold_ids(common, SCREENING),
                     frozen_method_revision=suite["method"]["method_revision"], status="pending",
                     phase_receipt_id=receipt["receipt_id"], phase_fold_ids=phase_fold_ids(common, phase),
-                    pending_fold_ids=cost["missing_candidate_fold_ids"], baseline_suite_id=baseline["suite_id"],
+                    pending_fold_ids=work["candidate"], baseline_suite_id=baseline["suite_id"],
                     confirmation_admission=receipt if phase == CONFIRMATION else None,
                     scheduling_status="confirmation_admitted" if phase == CONFIRMATION else "screening")
     progress.update(_phase_projection(camp, common, suite, baseline, receipt, c_scores, b_scores))
     _write(path, progress)
     state.update(phase=phase, phase_target_suite=suite["suite_id"], phase_reservation_id=receipt["receipt_id"],
                  screening_fold_ids=phase_fold_ids(common, SCREENING), status="training")
-    if cost["missing_baseline_fold_ids"]:
+    if work["baseline"]:
         bpath = camp / "suites" / baseline["suite_id"] / "suite_state.json"
         bp = read(bpath)
         bp.update(phase=phase, phase_fold_ids=phase_fold_ids(common, phase), phase_receipt_id=receipt["receipt_id"],
-                  phase_owner_suite=suite["suite_id"], status="pending", pending_fold_ids=cost["missing_baseline_fold_ids"])
+                  phase_owner_suite=suite["suite_id"], status="pending", pending_fold_ids=work["baseline"])
         bp.update(_phase_projection(camp, common, baseline, baseline, receipt, c_scores, b_scores))
         _write(bpath, bp)
         state["active_suite"] = baseline["suite_id"]
@@ -449,47 +442,43 @@ def before_launch(camp: Path, state: dict, suite: dict, fold: dict) -> dict:
     if fold["fold_id"] not in req["fold_work"][key] or suite["suite_id"] != req[key + "_suite_id"]:
         raise ValueError("phase_launch_not_admitted")
     # Identity checks can take time. Re-read control, API journals and the
-    # admission allocation after verification, immediately before launch intent.
+    # phase ownership after verification, immediately before launch intent.
     _latest_control(camp, state)
-    cost = reconcile_api_usage(camp, state)
+    reconcile_api_usage(camp, state)
     receipt = phase_reservation(camp, receipt["receipt_id"])
     if receipt["status"] != "active":
         raise ValueError("phase_launch_reservation_released")
-    job_ids = {path.parent.name for pattern in ("*/launch_intent.json", "*/job.json")
-               for path in (camp / "jobs").glob(pattern)}
-    used_jobs = max(state["training_jobs"], cost.get("training_jobs", 0), len(job_ids))
-    if (used_jobs + receipt["remaining_training_jobs"] > state["max_training_jobs"]
-            or float(cost.get("gpu_seconds_used", 0)) + receipt["remaining_gpu_seconds"] > state["max_gpu_seconds"]
-            or max(state.get("llm_calls", 0), cost.get("llm_calls", 0)) + receipt["remaining_llm_calls"] > state["max_llm_calls"]):
-        from react_agent.eeg_research.agentic.loop import _write
-        path = camp / "suites" / req["candidate_suite_id"] / "suite_state.json"
-        progress = read(path)
-        progress.update(scheduling_status="awaiting_budget_or_resources", admission_wait_reason="phase_launch_budget_changed")
-        _write(path, progress)
-        raise ValueError("phase_launch_budget_changed")
     return receipt
 
 
-def commit_screening(camp: Path, state: dict, suite: dict) -> dict:
+def commit_screening(camp: Path, state: dict, suite: dict, *, verified_result: dict | None = None) -> dict:
     from react_agent.eeg_research.agentic import method_suite as ms
     from react_agent.eeg_research.agentic.artifacts import register
-    common = ms.manifest(camp)
-    controls = suites_for_target(camp, "baseline")
-    baseline = controls[-1] if controls else None
-    scores = valid_scores(camp, suite, phase_fold_ids(common, SCREENING))
-    b_scores = valid_scores(camp, baseline, phase_fold_ids(common, SCREENING)) if baseline is not None else []
-    result = screening_result(common, suite, scores, baseline, b_scores)
-    if result["status"] != "complete":
-        raise ValueError("method_screening_requires_two_valid_matched_folds")
     path = camp / "suites" / suite["suite_id"] / "screening.json"
-    deps = [{"path": str(camp / "suites" / s["suite_id"] / row["fold_id"] / "benchmark.json"),
-             "sha256": digest(camp / "suites" / s["suite_id"] / row["fold_id"] / "benchmark.json")}
-            for s, rows in ((suite, scores), (baseline, b_scores)) if s is not None for row in rows]
-    wrapper = {"screening": result, "score_dependencies": list({row["path"]: row for row in deps}.values())}
-    if not path.exists():
-        write_once(path, wrapper)
+    if verified_result is not None:
+        result = verified_result
+        if (not path.is_file() or result.get("suite_id") != suite["suite_id"]
+                or result.get("suite_hash") != suite["suite_hash"]
+                or result.get("candidate_id") != suite["method"]["candidate_id"] or result.get("status") != "complete"):
+            raise ValueError("screening_verified_result_identity_mismatch")
     else:
-        read_screening(camp, suite["suite_id"])
+        common = ms.manifest(camp)
+        controls = suites_for_target(camp, "baseline", state=state)
+        baseline = controls[-1] if controls else None
+        scores = valid_scores(camp, suite, phase_fold_ids(common, SCREENING))
+        b_scores = (scores if baseline is not None and baseline["suite_id"] == suite["suite_id"] else
+                    valid_scores(camp, baseline, phase_fold_ids(common, SCREENING))) if baseline is not None else []
+        result = screening_result(common, suite, scores, baseline, b_scores)
+        if result["status"] != "complete":
+            raise ValueError("method_screening_requires_two_valid_matched_folds")
+        deps = [{"path": str(camp / "suites" / s["suite_id"] / row["fold_id"] / "benchmark.json"),
+                 "sha256": digest(camp / "suites" / s["suite_id"] / row["fold_id"] / "benchmark.json")}
+                for s, rows in ((suite, scores), (baseline, b_scores)) if s is not None for row in rows]
+        wrapper = {"screening": result, "score_dependencies": list({row["path"]: row for row in deps}.values())}
+        if not path.exists():
+            write_once(path, wrapper)
+        else:
+            read_screening(camp, suite["suite_id"])
     eid = "ev_screening_" + suite["suite_id"]
     existing = next((row for row in state.get("evidence", []) if row.get("evidence_id") == eid), None)
     if existing:
@@ -519,11 +508,16 @@ def commit_screening(camp: Path, state: dict, suite: dict) -> dict:
     return row
 
 
-def read_screening(camp: Path, suite_id: str, *, verified_suites: dict | None = None) -> dict:
+def read_screening(camp: Path, suite_id: str, *, verified_suites: dict | None = None,
+                   verified_suite: dict | None = None, verified_baseline: dict | None = None,
+                   verified_scores: list[dict] | None = None,
+                   verified_baseline_scores: list[dict] | None = None) -> dict:
     from react_agent.eeg_research.agentic import method_suite as ms
     common = ms.manifest(camp)
     ids = phase_fold_ids(common, SCREENING)
-    suite = ms.validate_suite(camp, suite_id, verify_data=True, fold_ids=ids)
+    suite = verified_suite if verified_suite is not None else ms.validate_suite(camp, suite_id, verify_data=True, fold_ids=ids)
+    if suite["suite_id"] != suite_id:
+        raise ValueError("method_suite_verified_identity_mismatch")
     wrapper = read(camp / "suites" / suite_id / "screening.json")
     ms.verify_dependencies(wrapper["score_dependencies"])
     baseline_hash = wrapper["screening"].get("baseline_suite_hash")
@@ -535,11 +529,14 @@ def read_screening(camp: Path, suite_id: str, *, verified_suites: dict | None = 
                         for score in wrapper["screening"].get("baseline_scores") or [] if score.get("freeze_ref")}
         if len(baseline_ids) == 1:
             baseline_id = baseline_ids.pop()
-            baseline = ms.validate_suite(camp, baseline_id, verify_data=True, fold_ids=ids)
-            if baseline["suite_hash"] != baseline_hash or baseline["method"]["candidate_id"] != "baseline":
+            baseline = (verified_baseline if verified_baseline is not None else
+                        ms.validate_suite(camp, baseline_id, verify_data=True, fold_ids=ids))
+            if (baseline["suite_id"] != baseline_id or baseline["suite_hash"] != baseline_hash
+                    or baseline["method"]["candidate_id"] != "baseline"):
                 raise ValueError("screening_matched_baseline_identity_mismatch")
-    scores = valid_scores(camp, suite, ids, suite_verified=True)
-    b_scores = (scores if baseline is suite else valid_scores(camp, baseline, ids, suite_verified=True)) if baseline is not None else []
+    scores = valid_scores(camp, suite, ids, suite_verified=True, verified_scores=verified_scores)
+    b_scores = (scores if baseline is suite else valid_scores(camp, baseline, ids, suite_verified=True,
+        verified_scores=verified_baseline_scores)) if baseline is not None else []
     actual = screening_result(common, suite, scores, baseline, b_scores)
     if actual != wrapper["screening"] or actual["status"] != "complete":
         raise ValueError("method_screening_result_changed")
@@ -553,7 +550,8 @@ def read_screening(camp: Path, suite_id: str, *, verified_suites: dict | None = 
 
 
 def verified_screening_records(camp: Path, state: dict, *, target_ids: set[str] | None = None,
-                               evidence_ids: set[str] | None = None) -> list[dict]:
+                               evidence_ids: set[str] | None = None,
+                               verified_results: dict | None = None, verified_suites: dict | None = None) -> list[dict]:
     rows = []
     for row in state.get("evidence", []):
         if row.get("kind") != "method_screening" or not row.get("evaluation_valid"):
@@ -562,7 +560,14 @@ def verified_screening_records(camp: Path, state: dict, *, target_ids: set[str] 
                 or evidence_ids is not None and row.get("evidence_id") not in evidence_ids):
             continue
         try:
-            if read_screening(camp, row["suite_id"]) == row["screening"] and digest(Path(row["suite_ref"])) == row["result_hash"]:
+            key = ("method_screening", row["suite_id"])
+            result = (verified_results or {}).get(key)
+            if result is None or verified_suites is not None and row["suite_id"] not in verified_suites:
+                result = read_screening(camp, row["suite_id"],
+                    **({"verified_suites": verified_suites} if verified_suites is not None else {}))
+                if verified_results is not None:
+                    verified_results[key] = result
+            if result == row["screening"] and digest(Path(row["suite_ref"])) == row["result_hash"]:
                 rows.append(row)
         except (OSError, ValueError, KeyError, TypeError):
             continue
@@ -589,7 +594,7 @@ def finish_phase(camp: Path, state: dict, suite: dict, progress: dict, services:
         ms.complete_scientific_feedback(camp, state, row, services)
         from react_agent.eeg_research.agentic.budget import settle_phase_feedback, phase_reservation
         receipt = phase_reservation(camp, progress["phase_receipt_id"])
-        settle_phase_feedback(camp, receipt["receipt_id"], row["evidence_id"], receipt["request"]["feedback_allocation_per_report"])
+        settle_phase_feedback(camp, receipt["receipt_id"], row["evidence_id"])
         state.update(active_suite=owner, live_job=None, status="training")
         save_state(camp, state)
         return True
@@ -641,10 +646,15 @@ def audit_evidence(camp: Path, state: dict) -> dict:
         path = path.resolve()
         actual = digest(path)
         if expected is not None and actual != expected:
-            raise ValueError("phase_audit_dependency_changed")
+            from .historical_runtime import dispatch_patch_matches
+            if not dispatch_patch_matches(camp, path, expected, actual):
+                raise ValueError("phase_audit_dependency_changed")
         deps[str(path)] = {"path": str(path), "kind": kind, "content_hash": actual,
                            "verification_status": "verified", "scope": "development", "data_use": "authorized_method_development_benchmark"}
     add(camp / ms.MANIFEST, kind="method_search_manifest")
+    from .historical_runtime import dispatch_patch_receipts
+    for receipt_path in dispatch_patch_receipts(camp):
+        add(receipt_path, kind="runtime_dispatch_patch")
     for dep in [*common["framework_dependencies"], *common["data_dependencies"], *common["cache_dependencies"]]:
         add(Path(dep["path"]), dep["sha256"])
     for row in [*screenings, *full]:
@@ -683,19 +693,27 @@ def audit_evidence(camp: Path, state: dict) -> dict:
             "statistical_significance": "not_established"}
 
 
-def progress_context(camp: Path, state: dict, goal: dict, budget: dict, actions: list[str]) -> dict:
+def progress_context(camp: Path, state: dict, goal: dict, budget: dict, actions: list[str], *,
+                     verified_screenings: list | None = None, verified_complete: list | None = None,
+                     phase_targets: dict | None = None) -> dict:
     from react_agent.eeg_research.agentic import method_suite as ms
-    screenings = verified_screening_records(camp, state)
-    complete = ms.verified_suite_records(camp, state)
+    screenings = verified_screening_records(camp, state) if verified_screenings is None else verified_screenings
+    complete = ms.verified_suite_records(camp, state) if verified_complete is None else verified_complete
     paired = [row for row in complete if row.get("candidate_id") != "baseline" and (row.get("comparison") or {}).get("comparable")]
-    phase_targets = planner_phase_targets(camp, state)
+    if phase_targets is None:
+        phase_targets = planner_phase_targets(camp, state)
     incomplete = []
+    scores_by_suite = {row["suite_id"]: row["aggregate"]["scores"] for row in complete}
+    detached = ms.completed_detached_suites(camp, state)
     for path in sorted((camp / "suites").glob("*/suite_state.json")):
+        if path.parent.name in detached or path.parent.name in scores_by_suite:
+            continue
         suite = ms.validate_suite(camp, path.parent.name, verify_data=True)
         if suite["method"]["candidate_id"] in state.get("detached_candidates", []):
             continue
         progress = read(path)
-        scores = valid_scores(camp, suite)
+        scores = valid_scores(camp, suite, suite_verified=True)
+        scores_by_suite[suite["suite_id"]] = scores
         ids = {row["fold_id"] for row in scores}
         selected = set(ms.manifest(camp)["selection_manifest"]["screening_fold_ids"])
         if len(ids) < 10:
@@ -705,10 +723,21 @@ def progress_context(camp: Path, state: dict, goal: dict, budget: dict, actions:
                                "screening_result": progress.get("screening_result"), "scheduling_status": progress.get("scheduling_status"),
                                "confirmation_admission": progress.get("confirmation_admission"),
                                "completed_fold_ids": sorted(ids), "pending_fold_ids": progress.get("pending_fold_ids", [])})
+    completed_by_target = {}
+    def completed(target):
+        if target not in completed_by_target:
+            suites = suites_for_target(camp, target, state=state)
+            scores = []
+            if suites:
+                suite = suites[-1]
+                if suite["suite_id"] not in scores_by_suite:
+                    scores_by_suite[suite["suite_id"]] = valid_scores(camp, suite)
+                scores = scores_by_suite[suite["suite_id"]]
+            completed_by_target[target] = [row["fold_id"] for row in scores]
+        return completed_by_target[target]
     minimum = min((phase_cost(ms.manifest(camp), CONFIRMATION if action == "run_confirmation" else SCREENING,
-                  [row["fold_id"] for row in valid_scores(camp, suites_for_target(camp, target)[-1])] if suites_for_target(camp, target) else [],
-                  [row["fold_id"] for row in valid_scores(camp, suites_for_target(camp, "baseline")[-1])] if suites_for_target(camp, "baseline") else [],
-                  target=target)["training_jobs"] for action, targets in phase_targets.items() for target in targets), default=None)
+                  completed(target), completed("baseline"), target=target)["training_jobs"]
+                  for action, targets in phase_targets.items() for target in targets), default=None)
     legal = [action for action in actions if action in {"design_experiment", "propose_experiment", "implement_candidate", "repair_candidate", "run_screening", "run_confirmation", "run_full", "diagnose_results"}]
     return {"evaluation_mode": "loso_method_search", "evaluation_schedule": "screen_then_confirm",
             "primary_metric": goal["primary_metric"], "unit": "staged_method_development", "screenings": screenings,
@@ -735,23 +764,48 @@ def recover(camp: Path, state: dict, *, probes_recovered: bool = False) -> dict:
     # Reconcile billing while preserving paid job/probe reconstruction. The
     # launch boundary blocks new GPU work until all unknown API outcomes settle.
     reconcile_api_usage(camp, state, block=False)
+    # Recovery writes scheduling/ledger projections, not these frozen inputs.
+    # Reuse native verification only for this invocation; advance/publication
+    # and the next tick enter through their ordinary independent validators.
+    verified_suites = {}
+    verified_scores = {}
+    verified_results = {}
+    sources_by_evidence_id = {}
+
+    def suite_for(suite_id):
+        if suite_id not in verified_suites:
+            verified_suites[suite_id] = ms.validate_suite(camp, suite_id, verify_data=True)
+        return verified_suites[suite_id]
+
+    def scores_for(suite_id):
+        if suite_id not in verified_scores:
+            suite = suite_for(suite_id)
+            if (camp / "suites" / suite_id / "aggregate.json").is_file():
+                result = ms.read_aggregate(camp, suite_id, verified_suite=suite)
+                verified_results[("method_suite", suite_id)] = result
+                verified_scores[suite_id] = result["scores"]
+            else:
+                verified_scores[suite_id] = valid_scores(camp, suite, suite_verified=True)
+        return verified_scores[suite_id]
+
     reservations = read(camp / "phase_reservations.json") if (camp / "phase_reservations.json").exists() else {}
     for saved in (reservations.get("receipts") or {}).values():
         if saved["status"] != "active":
             continue
         receipt = phase_reservation(camp, saved["receipt_id"])
         request = receipt["request"]
-        owner = ms.validate_suite(camp, request["candidate_suite_id"], verify_data=True)
+        owner = suite_for(request["candidate_suite_id"])
         if owner["method"]["candidate_id"] in state.get("detached_candidates", []):
             continue
         for key in ("candidate", "baseline"):
             suite_id = request[key + "_suite_id"]
-            suite = ms.validate_suite(camp, suite_id, verify_data=True)
+            suite = suite_for(suite_id)
             if suite_id == request["baseline_suite_id"] and not request["fold_work"]["baseline"] and suite_id != owner["suite_id"]:
                 continue
             path = camp / "suites" / suite_id / "suite_state.json"
             progress = read(path)
-            completed = [row["fold_id"] for row in valid_scores(camp, suite)]
+            saved_progress = copy.deepcopy(progress)
+            completed = [row["fold_id"] for row in scores_for(suite_id)]
             phase_ids = phase_fold_ids(ms.manifest(camp), request["phase"])
             missing = [fold for fold in phase_ids if fold not in completed]
             retry = request.get("engineering_retry") or {}
@@ -767,21 +821,22 @@ def recover(camp: Path, state: dict, *, probes_recovered: bool = False) -> dict:
             progress.update(phase=request["phase"], phase_receipt_id=receipt["receipt_id"], phase_fold_ids=phase_ids,
                             completed_folds=completed, pending_fold_ids=missing,
                             status="pending" if missing else "screened" if request["phase"] == SCREENING else "complete")
-            baseline = ms.validate_suite(camp, request["baseline_suite_id"], verify_data=True)
+            baseline = suite_for(request["baseline_suite_id"])
             progress.update(_phase_projection(camp, ms.manifest(camp), suite, baseline, receipt,
-                                              valid_scores(camp, owner), valid_scores(camp, baseline)))
+                                              scores_for(owner["suite_id"]), scores_for(baseline["suite_id"])))
             if suite_id != owner["suite_id"]:
                 progress["phase_owner_suite"] = owner["suite_id"]
             elif request["phase"] == CONFIRMATION:
                 progress["confirmation_admission"] = receipt
-            _write(path, progress)
+            if progress != saved_progress:
+                _write(path, progress)
         # Intent precedes process publication and state counters. Reconstruct
         # its original slot; a missing process record still blocks relaunch.
         for intent_path in (camp / "jobs").glob("*/launch_intent.json"):
             intent = read(intent_path)
             if intent.get("phase_receipt_id") != receipt["receipt_id"]:
                 continue
-            suite = ms.validate_suite(camp, intent["suite_id"])
+            suite = suite_for(intent["suite_id"])
             fold = next(row for row in suite["folds"] if row["fold_id"] == intent["fold_id"])
             if (intent["protocol_hash"] != fold["protocol"]["fingerprint"]
                     or intent["canonical_fold_hash"] != fold["canonical_fold_identity"]["canonical_hash"]):
@@ -791,25 +846,45 @@ def recover(camp: Path, state: dict, *, probes_recovered: bool = False) -> dict:
             existing = progress["jobs"].get(fold["fold_id"])
             if existing not in {None, intent_path.parent.name}:
                 raise ValueError("phase_recovery_multiple_launch_intents")
-            progress["jobs"][fold["fold_id"]] = intent_path.parent.name
-            _write(path, progress)
-            consume_phase_job(camp, receipt["receipt_id"], intent_path.parent.name, ms.manifest(camp)["gpu_seconds_estimate_per_suite"] / 10)
+            if existing is None:
+                progress["jobs"][fold["fold_id"]] = intent_path.parent.name
+                _write(path, progress)
+            consume_phase_job(camp, receipt["receipt_id"], intent_path.parent.name)
     active = []
+    detached = ms.completed_detached_suites(camp, state)
     for path in sorted((camp / "suites").glob("*/suite_state.json")):
+        if path.parent.name in detached:
+            continue
         progress = read(path)
-        suite = ms.validate_suite(camp, path.parent.name, verify_data=True)
+        saved_progress = copy.deepcopy(progress)
+        suite = suite_for(path.parent.name)
         if suite["method"]["candidate_id"] in state.get("detached_candidates", []):
             continue
-        scores = valid_scores(camp, suite)
+        scores = scores_for(suite["suite_id"])
         progress["completed_folds"] = [row["fold_id"] for row in scores]
         ids = progress.get("phase_fold_ids") or []
         progress["pending_fold_ids"] = [fold for fold in ids if fold not in progress["completed_folds"]]
         if (path.parent / "aggregate.json").exists():
-            ms.read_aggregate(camp, suite["suite_id"])
-            ms.commit_aggregate(camp, state, suite)
+            result = verified_results[("method_suite", suite["suite_id"])]
+            row = ms.commit_aggregate(camp, state, suite, verified_result=result)
+            checked = ms.verified_suite_records(camp, {"evidence": [row]},
+                verified_results=verified_results, verified_suites=verified_suites)
+            sources_by_evidence_id.update({item["evidence_id"]: item for item in checked})
         if (path.parent / "screening.json").exists():
-            read_screening(camp, suite["suite_id"])
-            commit_screening(camp, state, suite)
+            # Select the receipt's exact control before verification, never a
+            # newer baseline discovered by scanning historical directories.
+            saved = read(path.parent / "screening.json")["screening"]
+            baseline_ids = {Path(score["freeze_ref"]).parent.parent.name
+                            for score in saved.get("baseline_scores") or [] if score.get("freeze_ref")}
+            baseline_id = next(iter(baseline_ids)) if len(baseline_ids) == 1 else None
+            result = read_screening(camp, suite["suite_id"], verified_suite=suite, verified_scores=scores,
+                verified_baseline=verified_suites.get(baseline_id),
+                verified_baseline_scores=verified_scores.get(baseline_id))
+            verified_results[("method_screening", suite["suite_id"])] = result
+            row = commit_screening(camp, state, suite, verified_result=result)
+            checked = verified_screening_records(camp, {"evidence": [row]},
+                verified_results=verified_results, verified_suites=verified_suites)
+            sources_by_evidence_id.update({item["evidence_id"]: item for item in checked})
         if progress.get("phase_receipt_id"):
             receipt = phase_reservation(camp, progress["phase_receipt_id"])
             owner_complete = (receipt["request"]["candidate_suite_id"] == suite["suite_id"]
@@ -817,10 +892,12 @@ def recover(camp: Path, state: dict, *, probes_recovered: bool = False) -> dict:
             evidence_kind = "method_screening" if progress["phase"] == SCREENING else "method_suite"
             row = next((item for item in state.get("evidence", []) if item.get("suite_id") == suite["suite_id"]
                         and item.get("kind") == evidence_kind), None)
-            feedback_missing = row is not None and "analysis" not in ms.scientific_feedback_records(camp, state, row)
+            feedback_missing = row is not None and "analysis" not in ms.scientific_feedback_records(camp, state, row,
+                sources_by_evidence_id=sources_by_evidence_id)
             if receipt["status"] == "active" and (progress.get("status") in {"pending", "running"} or owner_complete or feedback_missing):
                 active.append((suite, progress, receipt))
-        _write(path, progress)
+        if progress != saved_progress:
+            _write(path, progress)
     owners = {receipt["request"]["candidate_suite_id"] for _, _, receipt in active}
     if len(owners) > 1:
         raise ValueError("method_multiple_active_phases")
@@ -829,7 +906,7 @@ def recover(camp: Path, state: dict, *, probes_recovered: bool = False) -> dict:
         suite, progress, receipt = next((item for item in active if item[0]["suite_id"] != owner), active[0])
         state.update(active_suite=suite["suite_id"], phase_target_suite=owner, phase=progress["phase"],
                      phase_reservation_id=receipt["receipt_id"], screening_fold_ids=ms.manifest(camp)["selection_manifest"]["screening_fold_ids"],
-                     gpu_seconds_reserved=receipt["remaining_gpu_seconds"], method_jobs_reserved=receipt["remaining_training_jobs"])
+                     gpu_seconds_reserved=0.0, method_jobs_reserved=0)
     else:
         state.update(active_suite=None, gpu_seconds_reserved=0.0, method_jobs_reserved=0)
     intents = {path.parent.name for path in (camp / "jobs").glob("*/launch_intent.json")}
@@ -837,6 +914,7 @@ def recover(camp: Path, state: dict, *, probes_recovered: bool = False) -> dict:
     cost = read(camp / "cost.json") if (camp / "cost.json").exists() else {}
     state["training_jobs"] = max(state["training_jobs"], len(intents | records), int(cost.get("training_jobs", 0)))
     state["gpu_seconds_left"] = state["max_gpu_seconds"] - float(cost.get("gpu_seconds_used", 0))
+    state.pop("method_gpu_reservation", None)
     return state
 
 
@@ -947,19 +1025,17 @@ def retry_phase_fold(camp: Path, state: dict, suite_id: str, fold_id: str, *, re
         raise ValueError("method_fold_engineering_retry_limit_reached")
     budget.charge_gpu(camp, state, record.get("gpu_seconds", 0), job_id=job_id)
     previous_receipt = budget.phase_reservation(camp, progress["phase_receipt_id"])
-    budget.consume_phase_job(camp, previous_receipt["receipt_id"], job_id, ms.manifest(camp)["gpu_seconds_estimate_per_suite"] / 10)
+    budget.consume_phase_job(camp, previous_receipt["receipt_id"], job_id)
     budget.settle_phase_job(camp, state, previous_receipt["receipt_id"], job_id)
     owner = ms.validate_suite(camp, previous_receipt["request"]["candidate_suite_id"], verify_data=True)
     baseline = ms.validate_suite(camp, previous_receipt["request"]["baseline_suite_id"], verify_data=True)
-    cost = phase_cost(ms.manifest(camp), progress["phase"], [row["fold_id"] for row in valid_scores(camp, owner)],
-                      [row["fold_id"] for row in valid_scores(camp, baseline)], target=owner["method"]["candidate_id"])
-    if (state["training_jobs"] + cost["training_jobs"] > state["max_training_jobs"]
-            or state["gpu_seconds_left"] < cost["gpu_seconds"]):
-        raise ValueError("method_phase_retry_remaining_work_unaffordable")
-    request = {**previous_receipt["request"], "training_jobs": cost["training_jobs"], "gpu_seconds": cost["gpu_seconds"],
-               "llm_calls": previous_receipt["request"]["feedback_allocation_per_report"] * cost["feedback_report_count"],
-               "phase_cost_estimate": cost,
-               "fold_work": {"candidate": cost["missing_candidate_fold_ids"], "baseline": cost["missing_baseline_fold_ids"]},
+    work = phase_fold_work(ms.manifest(camp), progress["phase"], [row["fold_id"] for row in valid_scores(camp, owner)],
+                           [row["fold_id"] for row in valid_scores(camp, baseline)], target=owner["method"]["candidate_id"])
+    # A new retry receipt binds only the remaining work and its immutable parent.
+    # Historical forecast fields stay in the original receipt, without authority.
+    request = {key: value for key, value in previous_receipt["request"].items()
+               if key not in {"training_jobs", "gpu_seconds", "llm_calls", "feedback_allocation_per_report", "phase_cost_estimate"}}
+    request = {**request, "fold_work": work,
                "engineering_retry": {"suite_id": suite_id, "fold_id": fold_id, "failed_job_id": job_id,
                                      "ordinal": len(attempts) + 1, "parent_receipt_id": previous_receipt["receipt_id"], "reason": reason}}
     # This native retry only queues work; pause remains in force until resume.
@@ -978,7 +1054,7 @@ def retry_phase_fold(camp: Path, state: dict, suite_id: str, fold_id: str, *, re
         other_progress["phase_receipt_id"] = receipt["receipt_id"]
         _write(other_path, other_progress)
     state.update(phase_reservation_id=receipt["receipt_id"], live_job=None, status="paused",
-                 method_jobs_reserved=receipt["remaining_training_jobs"], gpu_seconds_reserved=receipt["remaining_gpu_seconds"])
+                 method_jobs_reserved=0, gpu_seconds_reserved=0.0)
     event(camp, "method_phase_fold_retry_queued", suite_id=suite_id, fold_id=fold_id, failed_job_id=job_id,
           receipt_id=receipt["receipt_id"], engineering_retry=len(attempts))
     return {"status": "engineering_retry_queued", "suite_id": suite_id, "fold_id": fold_id,
@@ -990,6 +1066,9 @@ def detach_phase(camp: Path, state: dict, suite_id: str, receipt_hash: str) -> d
     from react_agent.eeg_research.agentic import method_suite as ms, budget, jobs
     from react_agent.eeg_research.agentic.candidate_lifecycle import require_reconciled
     from react_agent.eeg_research.agentic.loop import _write
+    completed = ms.completed_detached_suites(camp, state, historical_only=False).get(suite_id)
+    if completed is not None and completed["detach_receipt"] == receipt_hash:
+        return completed
     suite = ms.validate_suite(camp, suite_id)
     target = suite["method"]["candidate_id"]
     detach = (state.get("detached_candidates") or {}).get(target) if isinstance(state.get("detached_candidates"), dict) else None

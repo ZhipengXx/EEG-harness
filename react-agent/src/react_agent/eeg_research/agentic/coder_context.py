@@ -176,7 +176,21 @@ def _repair_context(view: dict[str, Any]) -> dict[str, Any]:
     """Review findings can require a repair even when all code checks passed."""
     result = {}
     if view.get("repair_context"):
-        result["native_check_repair"] = copy.deepcopy(view["repair_context"])
+        raw = view["repair_context"]
+        repair = {key: copy.deepcopy(value) for key, value in raw.items() if key not in {
+            "candidate_id", "approved_spec_hash", "attempt_id", "check_fingerprint", "error_fingerprint"}}
+        current = view.get("current_file")
+        if isinstance(current, dict) and raw.get("source_hash") == current.get("sha256"):
+            repair.pop("source_hash", None)
+        excerpt = repair.get("source_excerpt")
+        if isinstance(current, dict) and isinstance(excerpt, dict) and raw.get("source_hash"):
+            # The native repair producer reads this candidate's source. Exact
+            # hash/range/text matching below prevents sharing an old revision.
+            page = {**excerpt, "path": current.get("path"), "source_sha256": raw["source_hash"]}
+            shared = _shared_current_pages(page, current)
+            if shared.get("context_field") == "current_file":
+                repair["source_excerpt"] = shared
+        result["native_check_repair"] = repair
     spec = view.get("experiment_spec") or {}
     if not isinstance(spec, dict):
         return result
@@ -186,9 +200,25 @@ def _repair_context(view: dict[str, Any]) -> dict[str, Any]:
         # Preserve the original review revision/refs as feedback. A prior review
         # is never relabelled as evidence that the current source passed.
         result["previous_implementation_review"] = previous_review
-    if spec.get("audit_issues"):
-        result["audit_issues"] = copy.deepcopy(spec["audit_issues"])
+    from .approved_design_context import current_implementation_audit_issues
+    issues = current_implementation_audit_issues(spec,
+        candidate_id=(view.get("candidate_identity") or {}).get("candidate_id"))
+    if issues:
+        result["audit_issues"] = issues
     return result
+
+
+def _shared_current_pages(value: Any, current: Any) -> Any:
+    """Reference exact current source instead of repeating its failure excerpts."""
+    if isinstance(value, list):
+        return [_shared_current_pages(item, current) for item in value]
+    if not isinstance(value, dict):
+        return copy.deepcopy(value)
+    from .coder_source_view import source_page_visible
+    if isinstance(current, dict) and source_page_visible({"current_file": current}, value):
+        return {"context_field": "current_file", **{key: copy.deepcopy(item) for key, item in value.items()
+            if key not in {"text", "numbered_text"}}}
+    return {key: _shared_current_pages(item, current) for key, item in value.items()}
 
 
 def _interface(value: Any) -> dict[str, Any]:
@@ -261,13 +291,14 @@ def project_coder_input(native_payload: dict[str, Any]) -> dict[str, Any]:
     if execution:
         result["execution_state"] = execution
     current = result["current_file"].get("sha256") if isinstance(result["current_file"], dict) else None
-    feedback = {key: without_local_paths(_feedback_view(view[key], current)) for key in _FEEDBACK
+    feedback = {key: without_local_paths(_feedback_view(
+        _shared_current_pages(view[key], result["current_file"]), current)) for key in _FEEDBACK
         if key in view and view[key] not in (None, [], {})}
     if feedback:
         result["tool_feedback"] = feedback
     repair = _repair_context(view)
     if repair:
-        result["repair_context"] = repair
+        result["repair_context"] = without_local_paths(_feedback_view(repair, current))
     spec = view.get("experiment_spec") or {}
     spec = spec if isinstance(spec, dict) else {}
     instruction = view.get("current_user_instruction", spec.get("current_user_instruction"))
@@ -283,10 +314,8 @@ def project_coder_input(native_payload: dict[str, Any]) -> dict[str, Any]:
     implementation = view.get("relevant_implementation_hints") or {}
     if isinstance(implementation, dict) and implementation.get("notes"):
         hints["implementation_notes"] = copy.deepcopy(implementation["notes"])
-    memory = spec.get("retrieved_memory")
-    items = memory.get("items") if isinstance(memory, dict) else memory if isinstance(memory, list) else None
-    if isinstance(items, list) and items:
-        hints["retrieved_memory"] = {"items": copy.deepcopy(items)}
+    # Experimental history belongs to Planner/Critic. Only the current
+    # implementation notes and verified engineering repairs enter this role.
     if hints:
         result["hints"] = hints
     for field in ("previous_response", "previous", "previous_domain_response"):

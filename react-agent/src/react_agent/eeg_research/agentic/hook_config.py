@@ -40,6 +40,7 @@ def normalize_hook_config(
         model = dict(hook.get("model") or spec.get("model") or {})
         objective = dict(hook.get("objective") or spec.get("objective") or {})
         transform = dict(hook.get("transform") or spec.get("transform") or {})
+        training = hook.get("training", spec.get("training"))
         policy = hook.get("negative_sampling_policy") or spec.get("negative_policy") or spec.get("negative_sampling_policy")
         spec_hash = spec_hash or spec.get("spec_hash")
         spec_ref = spec_ref or spec.get("approval_ref") or spec.get("spec_ref")
@@ -53,6 +54,7 @@ def normalize_hook_config(
         model = dict(canonical.get("model") or {})
         objective = dict(canonical.get("objective") or {})
         transform = dict(canonical.get("transform") or {})
+        training = canonical.get("training")
         policy = canonical.get("negative_sampling_policy") or "data_parallel_local"
         spec_hash = spec_hash or canonical.get("spec_hash") or spec.get("spec_hash")
         spec_ref = spec_ref or canonical.get("experiment_ref") or spec.get("experiment_ref") or spec.get("spec_ref")
@@ -64,6 +66,8 @@ def normalize_hook_config(
         "transform": transform,
         "negative_sampling_policy": policy or "data_parallel_local",
     }
+    if isinstance(training, dict):
+        hook["training"] = dict(training)
     intervention = intervention or intervention_config_hash(hook)
     run_hash = run_hash or run_config_hash(hook, seed=seed, fidelity=fidelity)
     payload = {
@@ -80,9 +84,12 @@ def normalize_hook_config(
         "seed": seed,
         "fidelity": fidelity,
     }
+    if "training" in hook:
+        payload["training"] = hook["training"]
     if not payload["spec_hash"]:
         payload["spec_hash"] = _digest(
-            {key: payload[key] for key in ("model", "objective", "transform", "negative_sampling_policy")}
+            {key: payload[key] for key in ("model", "objective", "transform", "negative_sampling_policy", "training")
+             if key in payload}
         )
     return payload
 

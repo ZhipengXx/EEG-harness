@@ -19,8 +19,8 @@ and centered_energy_fraction; missing measurements are evidence_gaps. Separate
 observations from competing optimization/representation explanations. For a tiny
 matched pilot difference report hits, denominator and pp without significance or
 a universal promotion/rejection threshold. Suggest a legal diagnostic/full step
-only with its missing evidence, outcome-dependent decision and job opportunity
-cost. Preserve valid negative experiments as executed research, not code failure.
+only with its missing evidence and outcome-dependent decision. Preserve valid
+negative experiments as executed research, not code failure.
 
 HYPOTHESES
 A frozen baseline run needs no candidate hypothesis or candidate design approval.

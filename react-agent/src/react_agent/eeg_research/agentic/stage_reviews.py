@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .action_planning import digest
 from .artifacts import file_digest, lookup, register
-from .stage_contract import requirements_for_stage
+from .stage_contract import measurement_matches_scope, requirements_for_stage
 
 
 def _save(camp: Path, report: dict) -> dict:
@@ -57,10 +57,14 @@ def review_measurement(camp: Path, state: dict, latest: dict, experiment: dict, 
     binding = {key: latest.get(key) for key in ("evidence_id", "candidate_id", "source_hash", "spec_hash",
         "suite_id", "suite_hash", "method_revision", "seed", "fidelity", "result_hash")}
     binding.update(receipt_ref=str(receipt.resolve()), receipt_sha256=receipt_sha)
+    scope = experiment.get("evaluation_scope") or {}
+    if scope:
+        binding["evaluation_scope"] = copy.deepcopy(scope)
     identity_ok = bool(latest.get("evaluation_valid") is True and latest.get("source_hash")
         and latest.get("spec_hash") == experiment.get("spec_hash")
         and latest.get("result_hash") == receipt_sha and wrapper.get(result_key) == native
         and latest.get(result_key) == native
+        and measurement_matches_scope(latest, scope, native)
         and all(native.get(key) == latest.get(key) for key in ("candidate_id", "suite_hash", "method_revision", "seed", "fidelity")))
     complete = native.get("status") == "complete"
     required = native.get("required_fold_count")
@@ -73,7 +77,7 @@ def review_measurement(camp: Path, state: dict, latest: dict, experiment: dict, 
     metric = native.get("screening_mean_top1" if result_key == "screening" else "mean_top1")
     metric_ok = bool(complete and type(metric) in (int, float) and math.isfinite(metric) and 0 <= metric <= 1)
     outcomes = {
-        "run_identity": (identity_ok, "Native receipt matches the accepted candidate, source, spec and result bytes."),
+        "run_identity": (identity_ok, "Native receipt matches the current task scope and accepted candidate, source, spec and result bytes."),
         "paired_coverage": (identity_ok and coverage_ok, "Native completed coverage includes the required matched folds."),
         "metric_integrity": (identity_ok and metric_ok, "Native verifier reconstructed valid finite metrics and their aggregation; a negative delta remains valid."),
     }
@@ -98,13 +102,24 @@ def analysis_stage_payload(payload: dict, experiment: dict, measurement_review: 
     selected = payload.get("selected_research_task") or {}
     brief = experiment.get("design_brief") or {}
     research = {
+        "task_kind": selected.get("task_kind"),
+        "task_description": selected.get("task_description"),
         "question": selected.get("question") or payload.get("scientific_question"),
         "scientific_intent": selected.get("scientific_intent") or experiment.get("scientific_intent"),
         "hypothesis": payload.get("hypothesis") or experiment.get("hypothesis") or brief.get("hypothesis"),
         "intervention": experiment.get("intervention") or experiment.get("principal_intervention")
                         or brief.get("principal_intervention"),
         "expected_observation": selected.get("expected_observation") or brief.get("expected_observation"),
+        "comparison_observation_ids": selected.get("comparison_observation_ids") or None,
+        "reviewer_questions": (payload.get("analysis_evidence") or {}).get("reviewer_questions") or None,
     }
+    if selected.get("task_kind") == "diagnosis" or (selected.get("evaluation_scope") or {}).get("phase") == "diagnostic":
+        method = payload.get("experiment") or experiment
+        research["method_context"] = {key: copy.deepcopy(value) for key, value in {
+            "intervention": method.get("intervention") or method.get("principal_intervention")
+                            or brief.get("principal_intervention"),
+            "hypothesis": method.get("hypothesis")}.items() if value is not None}
+        research.pop("intervention", None)
     from .analysis_contract import build_analysis_facts
     facts = build_analysis_facts({**payload, "measurement_review": measurement_review})
     return {"analysis_context_version": "research_analysis_input.v1", "review_stage": "analysis",
@@ -121,14 +136,17 @@ def _review_single_measurement(camp: Path, state: dict, latest: dict, experiment
     job = Path(latest["job_dir"])
     record = json.loads((job / "job.json").read_text(encoding="utf-8"))
     protocol = load_protocol(camp)
-    native = accept_job(job, record.get("manifest"), latest["fidelity"], protocol=protocol)
+    run_protocol = load_protocol(Path(record["protocol_path"]).parent) if record.get("protocol_path") else protocol
+    native = accept_job(job, record.get("manifest"), latest["fidelity"], protocol=run_protocol)
     frozen = json.loads((job / "frozen_run_spec.json").read_text(encoding="utf-8"))
     source = json.loads((job / "source_binding.json").read_text(encoding="utf-8"))
+    scope = experiment.get("evaluation_scope") or {}
     identity_ok = bool(record.get("status") == "finished" and native.get("evaluation_valid") is True
         and record.get("result") == native and record.get("candidate_id") == latest.get("candidate_id")
         and frozen.get("spec_hash") == latest.get("spec_hash") == experiment.get("spec_hash")
         and source.get("file_sha256") == latest.get("source_hash")
         and frozen.get("seed") == latest.get("seed")
+        and measurement_matches_scope(latest, scope, native)
         and native.get("fixed_bank_top1") == latest.get("fixed_bank_top1"))
     declared_controls = [row for row in state.get("evidence") or []
         if row.get("evidence_id") == latest.get("control_id")]
@@ -140,7 +158,9 @@ def _review_single_measurement(camp: Path, state: dict, latest: dict, experiment
         control_job = Path(control["job_dir"])
         control_receipt = control_job / "job.json"
         control_record = json.loads(control_receipt.read_text(encoding="utf-8"))
-        accepted = accept_job(control_job, control_record.get("manifest"), control["fidelity"], protocol=protocol)
+        control_protocol = (load_protocol(Path(control_record["protocol_path"]).parent)
+                            if control_record.get("protocol_path") else protocol)
+        accepted = accept_job(control_job, control_record.get("manifest"), control["fidelity"], protocol=control_protocol)
         paired = bool(control_record.get("status") == "finished" and accepted.get("evaluation_valid") is True
             and control_record.get("result") == accepted and accepted.get("fixed_bank_top1") == control.get("fixed_bank_top1"))
         if paired:
@@ -165,6 +185,8 @@ def _review_single_measurement(camp: Path, state: dict, latest: dict, experiment
         "seed", "fidelity", "execution_fingerprint")}
     binding.update(receipt_ref=str(receipt.resolve()), receipt_sha256=file_digest(receipt),
                    accepted_result_digest=digest(native), **control_binding)
+    if scope:
+        binding["evaluation_scope"] = copy.deepcopy(scope)
     return _save(camp, {"schema_version": "eeg_research.stage_review.v1", "stage": "measurement",
         "authority": "native_verified_measurement", "status": "completed" if identity_ok and not missing else "blocked",
         "binding": binding, "requirements_digest": digest(requirements), "requirement_coverage": rows,

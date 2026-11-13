@@ -59,7 +59,7 @@ def parameter_count_comparison(report: dict[str, Any]) -> dict[str, Any]:
 def verified_parameter_count_comparisons(camp: Path, state: dict[str, Any], *, limit: int = 12,
                                         protocol: dict[str, Any] | None = None) -> dict[str, Any]:
     from react_agent.eeg_research.agentic.artifacts import resolve_verified_artifact, file_digest
-    from react_agent.eeg_research.agentic.run_context import load_approved_binding
+    from react_agent.eeg_research.agentic.run_context import load_approved_binding, resolve_execution_protocol
     if protocol is None:
         try:
             protocol = json.loads((camp / 'execution_protocol.json').read_text())
@@ -80,7 +80,7 @@ def verified_parameter_count_comparisons(camp: Path, state: dict[str, Any], *, l
                         or report.get('schema_version') != 'eeg_research.controlled_parent_comparison.v1'
                         or report.get('status') != 'verified'
                         or report.get('final_test_accessed') is not False
-                        or not fingerprint or report.get('execution_fingerprint') != fingerprint):
+                        or not fingerprint):
                     continue
                 for side, key in (('candidate', 'candidate_id'), ('parent', 'parent_candidate_id')):
                     target = str(report[key]); binding = load_approved_binding(camp, target) or {}
@@ -88,12 +88,15 @@ def verified_parameter_count_comparisons(camp: Path, state: dict[str, Any], *, l
                             or binding.get('spec_hash') != report[side + '_spec_hash']
                             or file_digest(camp/'candidates'/target/'extension/eeg_candidate.py') != binding['source_hash']):
                         raise ValueError('comparison_binding_changed')
+                    method_protocol = resolve_execution_protocol(camp, target, protocol, binding=binding)
+                    if side == 'candidate' and report.get('execution_fingerprint') != method_protocol.get('fingerprint'):
+                        raise ValueError('comparison_candidate_protocol_changed')
                     run = next(row for row in state.get('evidence') or []
                                if row.get('evidence_id') == report[side + '_evidence_id'])
                     if (run.get('evaluation_valid') is not True or run.get('candidate_id') != target
                             or run.get('seed') != report.get('seed') or run.get('fidelity') != report.get('fidelity')
                             or run.get('source_hash') != binding['source_hash'] or run.get('spec_hash') != binding['spec_hash']
-                            or run.get('execution_fingerprint') != report.get('execution_fingerprint')):
+                            or run.get('execution_fingerprint') != method_protocol.get('fingerprint')):
                         raise ValueError('comparison_run_binding_changed')
                 seen.add(ref)
                 rows.append({key: report.get(key) for key in ('candidate_id', 'parent_candidate_id', 'seed', 'fidelity',

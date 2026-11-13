@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
-from react_agent.eeg_research.agentic.schemas import Comparison, comparison_key, protocol_is_comparable
+
+def meets_gain_threshold(gain: float, threshold: float) -> bool:
+    """Inclusive gain threshold in percentage points, with float-roundoff tolerance."""
+    return gain >= threshold or math.isclose(gain, threshold, rel_tol=0.0, abs_tol=1e-12)
 
 
 def matched_control(
@@ -13,12 +17,14 @@ def matched_control(
     protocol: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
     """Return the same-protocol, same-fidelity, same-training-seed baseline row."""
+    from .schemas import protocol_is_comparable
+
     ok, _reason = protocol_is_comparable(protocol)
     if not ok:
         return None
     seed = result.get("training_seed", result.get("seed"))
     fidelity = result.get("fidelity")
-    fingerprint = result.get("execution_fingerprint") or result.get("contract_fingerprint")
+    fingerprint = result.get("evaluation_comparison_fingerprint") or result.get("execution_fingerprint") or result.get("contract_fingerprint")
     for row in reversed(evidence):
         if row.get("candidate_id") != "baseline":
             continue
@@ -28,7 +34,7 @@ def matched_control(
             continue
         if int(row.get("seed") or 0) != int(seed or 0):
             continue
-        row_fp = row.get("execution_fingerprint") or row.get("contract_fingerprint")
+        row_fp = row.get("evaluation_comparison_fingerprint") or row.get("execution_fingerprint") or row.get("contract_fingerprint")
         if fingerprint and row_fp and row_fp != fingerprint:
             continue
         return row
@@ -42,6 +48,8 @@ def compare_runs(
     protocol: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Build a Comparison dict. Feasibility-only jobs are not marked compared."""
+    from .schemas import Comparison, comparison_key, protocol_is_comparable
+
     comparable_protocol, reason = protocol_is_comparable(protocol)
     if candidate.get("candidate_id") == "baseline":
         payload = Comparison(
@@ -104,7 +112,8 @@ def compare_runs(
         fidelity=str(candidate.get("fidelity") or ""),
         training_seed=int(candidate.get("seed") or 0),
         evidence_level="observed",
-        difference_sources=["source_hash"] if candidate.get("candidate_id") != "baseline" else [],
+        difference_sources=[name for name in ("source_hash", "training_recipe")
+                            if candidate.get(name) != control.get(name)],
         reason="matched_control",
     )
     data = payload.model_dump()

@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 from react_agent.eeg_training.inference_consistency import file_digest, object_digest
+from react_agent.eeg_research.agentic.interface import training_batch_sizes, training_replica_count
 
 
 class ProbeRecoveryBlocked(RuntimeError):
@@ -42,7 +43,8 @@ def _settle(directory: Path) -> dict:
     import fcntl
     from react_agent.eeg_research.agentic.budget import charge_gpu
     request, intent, record = _read(directory / "request.json"), _read(directory / "intent.json"), _read(directory / "process.json")
-    if file_digest(directory / "request.json") != intent.get("request_sha256"):
+    request_sha256 = file_digest(directory / "request.json")
+    if request_sha256 != intent.get("request_sha256"):
         raise RuntimeError("multigpu_probe_request_changed_before_settlement")
     camp = Path(request["camp"])
     if record.get("status") not in {"finished", "failed", "deadline", "uncertain"}:
@@ -50,18 +52,22 @@ def _settle(directory: Path) -> dict:
     actual = (float(record["ended_at"]) - float(intent["started_at"])) * len(request["gpu"])
     if record["status"] == "uncertain":
         actual = actual if record.get("verified_child_alive_past_deadline") else float(intent["max_gpu_seconds"])
+    result = {**record, "gpu_seconds": max(0.0, actual), "probe_identity": request["probe_identity"],
+              "cost_ledger": str(camp / "cost.json"), "data_scope": "synthetic_training_inputs_only",
+              "request_sha256": request_sha256}
     with (camp / "multigpu_cost.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        receipt = _read(directory / "receipt.json")
+        if receipt and receipt != result:
+            raise RuntimeError("multigpu_probe_terminal_receipt_changed")
         state, cost = _read(camp / "campaign_state.json"), _read(camp / "cost.json")
         accounting = {"gpu_seconds_left": float(state["max_gpu_seconds"]) - float(cost.get("gpu_seconds_used") or 0),
                       "gpu_seconds_reserved": 0, "training_jobs": int(state.get("training_jobs") or cost.get("training_jobs") or 0)}
         from .owner_budget import settle_engineering_gpu
         settle_engineering_gpu(camp,request["probe_identity"],max(0.0,actual),uncertain=record["status"]=="uncertain")
         charge_gpu(camp, accounting, max(0.0, actual), job_id="engineering_multigpu_" + request["probe_identity"])
-    result = {**record, "gpu_seconds": max(0.0, actual), "probe_identity": request["probe_identity"],
-              "cost_ledger": str(camp / "cost.json"), "data_scope": "synthetic_training_inputs_only",
-              "request_sha256": file_digest(directory / "request.json")}
-    _write(directory / "receipt.json", result)
+        if not receipt:
+            _write(directory / "receipt.json", result)
     return result
 
 
@@ -83,17 +89,22 @@ def validate_receipt(camp: Path, protocol: dict, receipt: dict, *, workspace: Pa
     parent = _read(Path(camp) / "method_search_manifest.json")
     inventory = parent["gpu_inventory"]
     expected_inventory = [{key: row[key] for key in ("index", "uuid", "name", "total_memory_mib")} for row in inventory]
-    samples = len(protocol.get("train_query_ids") or [])
+    first_batch, tail_batch = training_batch_sizes(protocol)
+    manager_hash = file_digest(Path(__file__))
+    manager_matches = request.get("manager_source_sha256") == manager_hash
+    if not manager_matches:
+        from .historical_runtime import dispatch_patch_matches
+        manager_matches = dispatch_patch_matches(camp, Path(__file__), request.get("manager_source_sha256"), manager_hash)
     if (request.get("manifest_hash") != parent.get("manifest_hash") or parent.get("manifest_hash") != object_digest({key: value for key, value in parent.items() if key != "manifest_hash"})
             or request.get("source_sha256") != file_digest(source) or request.get("hook_config") != config
             or request.get("gpu") != protocol["gpu"] or request.get("gpu_inventory") != expected_inventory
-            or request.get("input_geometry") != protocol["input_geometry"] or request.get("batch_size") != protocol["batch_size"]
-            or request.get("tail_batch_size") != (samples % protocol["batch_size"] or protocol["batch_size"])
+            or request.get("input_geometry") != protocol["input_geometry"] or request.get("batch_size") != first_batch
+            or request.get("tail_batch_size") != tail_batch
             or request.get("lr") != protocol["lr"] or request.get("weight_decay") != protocol["weight_decay"]
             or request.get("negative_sampling_policy") != protocol["negative_sampling_policy"]
             or request.get("checkpoint_policy") != protocol["checkpoint_policy"]
             or request.get("probe_source_sha256") != file_digest(Path(__file__).with_name("multigpu_probe.py"))
-            or request.get("manager_source_sha256") != file_digest(Path(__file__))
+            or not manager_matches
             or request.get("training_entry_sha256") != file_digest(Path(__file__).resolve().parents[2] / "eeg_training" / "train_entry.py")):
         raise ValueError("multigpu_probe_current_source_config_or_recipe_mismatch")
     result = receipt.get("result") or {}
@@ -172,13 +183,13 @@ def run_multigpu_check(camp: Path, protocol: dict, *, workspace: Path | None = N
     camp = Path(camp).resolve()
     if protocol.get("evaluation_mode") != "loso_method_search":
         return {"ok": False, "error": "multigpu_probe_requires_opt_in_mode"}
-    if protocol.get("negative_sampling_policy") != "data_parallel_local" or int(protocol["batch_size"]) != 1024:
+    if protocol.get("negative_sampling_policy") != "data_parallel_local":
         return {"ok": False, "error": "multigpu_probe_recipe_mismatch"}
     parent = _read(camp / "method_search_manifest.json")
     if parent.get("manifest_hash") != object_digest({key: value for key, value in parent.items() if key != "manifest_hash"}):
         return {"ok": False, "status": "blocked", "error": "multigpu_probe_manifest_digest_mismatch"}
     cards, inventory = list(protocol["gpu"]), parent.get("gpu_inventory") or []
-    if cards != parent.get("gpu") or len(cards) < 2 or [row["index"] for row in inventory] != cards:
+    if cards != parent.get("gpu") or not cards or [row["index"] for row in inventory] != cards:
         return {"ok": False, "error": "multigpu_probe_frozen_cards_missing_or_mismatched"}
     if not python: python = torch_python()
     if not python: return {"ok": False, "error": "torch_python_missing"}
@@ -186,12 +197,15 @@ def run_multigpu_check(camp: Path, protocol: dict, *, workspace: Path | None = N
     assigned = assigned.get("experiment") or assigned
     source = workspace / "extension" / "eeg_candidate.py" if workspace is not None else Path(baseline_manifest()["entry"])
     config = {key: assigned.get(key) or {} for key in ("model", "objective", "transform")}
-    samples = len(protocol.get("train_query_ids") or [])
-    if not samples or samples < 1024:
+    first_batch, tail_batch = training_batch_sizes(protocol)
+    if first_batch < 1:
         return {"ok": False, "error": "multigpu_probe_real_training_population_missing"}
+    if training_replica_count(first_batch, len(cards)) != len(cards):
+        return {"ok": False, "error": "multigpu_probe_batch_cannot_cover_frozen_cards",
+                "batch_size": first_batch, "device_count": len(cards)}
     identity = {"source_sha256": file_digest(source), "hook_config": config, "gpu": cards, "manifest_hash": parent["manifest_hash"],
         "gpu_inventory": [{key: row[key] for key in ("index", "uuid", "name", "total_memory_mib")} for row in inventory],
-        "input_geometry": protocol["input_geometry"], "batch_size": 1024, "tail_batch_size": (samples % 1024) or 1024,
+        "input_geometry": protocol["input_geometry"], "batch_size": first_batch, "tail_batch_size": tail_batch,
         "lr": protocol["lr"], "weight_decay": protocol["weight_decay"], "negative_sampling_policy": "data_parallel_local",
         "checkpoint_policy": protocol["checkpoint_policy"], "python": python,
         "probe_source_sha256": file_digest(Path(__file__).with_name("multigpu_probe.py")),
@@ -199,6 +213,17 @@ def run_multigpu_check(camp: Path, protocol: dict, *, workspace: Path | None = N
         "training_entry_sha256": file_digest(Path(__file__).resolve().parents[2] / "eeg_training" / "train_entry.py")}
     probe_id = object_digest(identity)
     directory = camp / "engineering_checks" / "multigpu" / probe_id
+    # A dispatch-only repair does not invalidate a completed identical probe.
+    # New probes still record the source they actually run.
+    if not (directory / "intent.json").exists():
+        from .historical_runtime import dispatch_patch_matches
+        manager = next((row for row in parent.get("framework_dependencies", [])
+                        if row["path"] == str(Path(__file__).resolve())), None)
+        if manager and dispatch_patch_matches(camp, Path(__file__), manager["sha256"], identity["manager_source_sha256"]):
+            prior_id = object_digest({**identity, "manager_source_sha256": manager["sha256"]})
+            prior_dir = camp / "engineering_checks" / "multigpu" / prior_id
+            if (prior_dir / "intent.json").exists():
+                directory = prior_dir
     from react_agent.eeg_research.agentic.loso_study import gpu_inventory
     actual_inventory = gpu_inventory(tuple(cards), allow_shared=True)
     if [{key: row[key] for key in ("index", "uuid", "name", "total_memory_mib")} for row in actual_inventory] != identity["gpu_inventory"]:
@@ -212,12 +237,18 @@ def run_multigpu_check(camp: Path, protocol: dict, *, workspace: Path | None = N
     state, cost = _read(camp / "campaign_state.json"), _read(camp / "cost.json")
     if state.get("live_job"):
         return {"ok": False, "status": "blocked", "error": "multigpu_probe_requires_idle_training_runtime"}
-    available = float(state["max_gpu_seconds"]) - float(cost.get("gpu_seconds_used") or 0) - float(state.get("gpu_seconds_reserved") or 0)
-    cap = float(timeout_s) * len(cards)
-    if available < cap or timeout_s <= 1:
-        return {"ok": False, "status": "blocked", "error": "multigpu_probe_budget_insufficient", "required_gpu_seconds": cap, "available_gpu_seconds": available}
+    available = max(0.0, float(state["max_gpu_seconds"]) - float(cost.get("gpu_seconds_used") or 0))
+    requested_cap = float(timeout_s) * len(cards)
+    if timeout_s <= 1:
+        return {"ok": False, "status": "blocked", "error": "multigpu_probe_budget_insufficient", "required_gpu_seconds": requested_cap, "available_gpu_seconds": available}
     from .owner_budget import claim_engineering_gpu
-    claim_engineering_gpu(camp,probe_id,cap)
+    claim = claim_engineering_gpu(camp,probe_id,requested_cap)
+    # Only this probe's execution timeout is bounded here. Unused phase or
+    # selected-plan forecasts do not consume the available GPU seconds.
+    cap = float(claim["requested"]["gpu_seconds"]) if claim else min(requested_cap, available)
+    timeout_s = cap / len(cards)
+    if cap <= 0:
+        return {"ok": False, "status": "blocked", "error": "multigpu_probe_budget_insufficient", "required_gpu_seconds": requested_cap, "available_gpu_seconds": available}
     # Inventory is read in the actual process environment; mutable occupancy is
     # not confused with the immutable physical UUID/card binding.
     directory.mkdir(parents=True, exist_ok=False)

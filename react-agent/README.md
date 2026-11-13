@@ -45,12 +45,86 @@ The workbench is available at [http://127.0.0.1:8765](http://127.0.0.1:8765).
 The ReAct entry originates from the [LangGraph ReAct template](https://github.com/langchain-ai/react-agent). Its optional search and model configuration are separate from the two research workflows.
 
 
+## Paper memory before the first Planner
+
+For a new `single_plan_v1` campaign, add this to the goal JSON:
+
+```json
+{
+  "literature_memory": {
+    "enabled": true,
+    "max_papers": 10,
+    "search_results_per_query": 20,
+    "max_queries": 3,
+    "top_k": 8,
+    "prompt_content_tokens": 6000,
+    "paper_input_tokens": 24000
+  }
+}
+```
+
+The first Planner initializes paper memory once. Later rounds retrieve it
+alongside experiment memory, each with its own allowance. MiniLM uses the same
+model configuration and process cache as experiment memory; the paper index is
+stored separately at `literature_memory/index.sqlite`.
+
+The researcher receives only `research_question`, `task_setting` and
+`evaluation_protocol`, derived locally from the goal and frozen protocol. Set
+`research_question` explicitly in the goal to narrow the scientific question.
+For each paper, DeepSeek also receives the actual text, title and reading
+coverage. It returns `findings`, whose items contain `topic`, `statement` and
+`reported_setup` (`task`, `training`, `evaluation`; unreported values are null).
+URLs, source references, hashes and original text ranges are attached locally.
+
+GPT Researcher supplies OpenAlex search and document readers. DeepSeek query
+planning and extraction use the existing API ledger and correction loop
+(initial call plus at most five corrections, subject to the campaign budget).
+There is no extra summarizer or reviewer. A ten-paper initialization normally
+uses eleven API calls; later retrieval uses none. Planner and Critic share the
+same retrieved cards; Designer receives the selected plan's cited cards.
+
+Search depth is independent of the reading limit: each query returns up to 20
+metadata candidates, then local relevance and diversity ranking selects up to
+10 readable papers. Completed acquisition and extraction steps are reused on
+restart. Each round retrieves up to eight complete findings within the separate
+6000-token scientific-content allowance, using the overall goal and current
+research focus. Ranking scores and cache diagnostics stay local.
+
+Install the optional reader dependencies in the agent's Python 3.12+ environment:
+
+```bash
+uv pip install --python "$AGENT_PYTHON" -r requirements-literature.txt
+```
+
+They are separated from the project-wide extras because the legacy fMRI `p2`
+dependency constraints conflict with GPT Researcher's dependencies in a combined
+lock. The existing agent/training environment is not changed automatically.
+MiniLM needs the existing `memory` dependency and local model cache described below.
+
+Preview the scientific input without an API call, or initialize papers explicitly:
+
+```bash
+PYTHONPATH=src "$AGENT_PYTHON" -m react_agent.eeg_research.agentic.literature_bootstrap \
+  --campaign "$CAMPAIGN_DIR"
+PYTHONPATH=src "$AGENT_PYTHON" -m react_agent.eeg_research.agentic.literature_bootstrap \
+  --campaign "$CAMPAIGN_DIR" --execute --retrieve
+```
+
+The campaign saves inputs, query results, read text and validated extractions in
+`literature_memory/`, and API traces in the existing `llm_requests/` and
+`llm_responses/` directories. Completed steps are reused on resume. Full papers
+remain on disk; oversized reader input selects complete paragraphs/pages and
+records the original ranges. The 6000-token literature allowance counts the
+three scientific values, not fixed JSON keys or provenance; it selects whole
+cards and does not change the experiment-memory per-observation allowance.
+
 ## Optional campaign memory: MiniLM and procedural skills
 
 Campaign memory is opt-in. Existing campaigns, empirical lessons, approvals,
 training hashes, method cards and the fMRI memory remain on their original paths.
 No embedding model is imported or loaded and no semantic database is opened when
-`memory` is absent or `enabled` is false.
+both experiment memory and paper memory are disabled. Paper memory can reuse
+the configured encoder independently of experiment-memory retrieval.
 
 Add a `memory` block when creating a new campaign goal. The immutable revision
 below was verified with the real model on CPU:

@@ -1,4 +1,4 @@
-"""Apply future Coder/Reviewer settings without rewriting started work."""
+"""Apply future role settings without rewriting started work."""
 from __future__ import annotations
 
 import json
@@ -6,7 +6,8 @@ from pathlib import Path
 
 from .role_config import ALIASES, FIELDS, resolve_role_config
 
-CONFIGURABLE_ROLES = frozenset({"candidate_coder", "candidate_reviewer"})
+PLANNING_ROLES = frozenset({"research_planner", "research_critic"})
+CONFIGURABLE_ROLES = frozenset({"candidate_coder", "candidate_reviewer", "result_analyst"}) | PLANNING_ROLES
 ACTIVE_TASK_STATUSES = frozenset({"pending", "running", "waiting_for_evidence"})
 
 
@@ -32,7 +33,7 @@ def _require_stage_boundary(camp: Path, state: dict) -> None:
                 tasks.setdefault(row["task_id"], {}).update(row)
     if any(row.get("role") in CONFIGURABLE_ROLES and row.get("status") in ACTIVE_TASK_STATUSES
            for row in tasks.values()):
-        raise ValueError("role_configuration_has_started_coding_task")
+        raise ValueError("role_configuration_has_started_role_task")
     # A request reserved before a process exit is still started work, even when
     # there is no corresponding task-ledger row yet.
     cost_path = camp / "cost.json"
@@ -58,10 +59,14 @@ def apply_role_configuration(camp: Path, state: dict, overrides: dict, *, reason
     for name, fields in overrides.items():
         role = ALIASES.get(name, name)
         if role not in CONFIGURABLE_ROLES:
-            raise ValueError("role_configuration_only_coder_and_reviewer")
+            raise ValueError("role_configuration_unsupported_role")
         if (role in requested or not isinstance(fields, dict) or not fields
                 or set(fields).difference(FIELDS)):
             raise ValueError("invalid_role_config_fields")
+        # A waiting planning round keeps its model, token budget and proposals;
+        # only the deadline of its next request changes.
+        if role in PLANNING_ROLES and set(fields) != {"timeout_s"}:
+            raise ValueError("planning_role_configuration_timeout_only")
         requested[role] = fields
     _require_stage_boundary(camp, state)
     path = camp / "role_config_overrides.json"
@@ -90,7 +95,7 @@ def apply_role_configuration(camp: Path, state: dict, overrides: dict, *, reason
     if changed:
         _write(path, updated)
         event(camp, "role_configuration_updated", reason=reason.strip(),
-              scope="future_unstarted_coder_and_reviewer_tasks", requested=requested,
+              scope="future_unstarted_role_tasks", requested=requested,
               previous=before, effective=effective)
-    return {"changed": changed, "scope": "future_unstarted_coder_and_reviewer_tasks",
+    return {"changed": changed, "scope": "future_unstarted_role_tasks",
             "overrides_path": str(path), "roles": effective}

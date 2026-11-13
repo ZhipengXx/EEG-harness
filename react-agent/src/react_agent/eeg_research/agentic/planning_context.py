@@ -60,7 +60,7 @@ def _expanded(view):
 
 def _source(value):
     result = _pick(value, ("candidate_id", "intervention", "hypothesis", "source", "source_ref",
-        "source_truncated", "missing_inputs", "model", "objective", "transform", "recipe",
+        "source_truncated", "missing_inputs", "model", "objective", "transform", "training", "recipe",
         "frozen_training_policy", "negative_sampling_policy"))
     if isinstance(value, dict) and isinstance(value.get("encoder_reference"), dict):
         result["encoder_reference"] = _pick(value["encoder_reference"], ("excerpt", "source_ref"))
@@ -77,7 +77,7 @@ def _v2_science(value):
     if not isinstance(value, dict):
         return copy.deepcopy(value)
     preserve = {"model", "objective", "transform", "config", "scientific_parameters", "metrics",
-                "scores", "paired_scores", "parameters", "hyperparameters", "training_recipe", "measurements"}
+                "scores", "paired_scores", "parameters", "hyperparameters", "training", "training_recipe", "measurements"}
     omit = {"schema_version", "validation_records", "check", "checks", "cpu_check_receipt",
         "approval_record", "operation_binding", "coding_recovery", "next_read", "next_reads",
         "read_capability", "read_unit", "json_pointer", "verification_artifact",
@@ -131,6 +131,169 @@ def _v2_observations(full, view):
     return rows
 
 
+_REFERENCE_RUN_FIELDS = ("learning_profiles", "training_execution")
+
+
+def _expand_shared_facts(value, shared):
+    if isinstance(value, dict):
+        if set(value) == {"shared_fact_ref"}:
+            return copy.deepcopy(shared[value["shared_fact_ref"]])
+        return {key: _expand_shared_facts(child, shared) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_expand_shared_facts(child, shared) for child in value]
+    return copy.deepcopy(value)
+
+
+def _share_common_facts(view):
+    """Share exact geometry, scope and training facts after memory selection."""
+    import json
+    groups = {}
+
+    def add(parent, field, kind):
+        value = parent.get(field)
+        if not isinstance(value, dict) or not value:
+            return
+        encoded = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        groups.setdefault((kind, encoded), []).append((parent, field))
+
+    protocol = view.get("protocol") or {}
+    add(protocol, "input_geometry", "geometry")
+    add(protocol, "evidence_scope", "scope")
+    facts = []
+    for row in view.get("observations") or []:
+        add(row.get("applicability") or {}, "input_geometry", "geometry")
+        native = row.get("native_facts") or {}
+        add(native, "science_scope", "scope")
+        facts.append(native)
+    facts.extend((view.get("shared_reference_results") or {}).values())
+    for native in facts:
+        for row in native.get("training_execution") or []:
+            add(row, "common", "training")
+    shared = {}
+    for (kind, encoded), locations in groups.items():
+        if len(locations) < 2:
+            continue
+        name = kind + "_" + str(len(shared) + 1)
+        reference = {"shared_fact_ref": name}
+        # Keep small values inline when a reference would increase the input.
+        if (len(locations) - 1) * len(encoded) <= len(locations) * len(json.dumps(reference)) + len(name) + 4:
+            continue
+        shared[name] = copy.deepcopy(locations[0][0][locations[0][1]])
+        for parent, field in locations:
+            parent[field] = dict(reference)
+    if shared:
+        view["shared_facts"] = shared
+    return view
+
+
+def expanded_observations(view):
+    """Restore full observation rows from references within this request."""
+    common = view.get("shared_facts") or {}
+    rows = _expand_shared_facts(view.get("observations") or [], common)
+    shared = _expand_shared_facts(view.get("shared_reference_results") or {}, common)
+    for row in rows:
+        facts = row.get("native_facts") or {}
+        for field in _REFERENCE_RUN_FIELDS:
+            if field not in facts:
+                continue
+            values = []
+            for item in facts[field]:
+                if set(item) == {"control_ref"}:
+                    values.extend(copy.deepcopy(shared[item["control_ref"]][field]))
+                else:
+                    values.append(item)
+            facts[field] = values
+    return rows
+
+
+def _share_reference_results(view):
+    """Factor identical, source-bound baseline run groups after card selection."""
+    import json
+
+    result = _expand_shared_facts(view, view.get("shared_facts") or {})
+    result.pop("shared_facts", None)
+    result["observations"] = expanded_observations(view)
+    result.pop("shared_reference_results", None)
+    groups = {}
+    for index, row in enumerate(result["observations"]):
+        facts = row.get("native_facts") or {}
+        blocks, spans = {}, {}
+        for field in _REFERENCE_RUN_FIELDS:
+            values = facts.get(field) or []
+            positions = [i for i, item in enumerate(values) if item.get("arm") == "baseline"]
+            if positions and positions == list(range(positions[0], positions[-1] + 1)):
+                start, end = positions[0], positions[-1] + 1
+                blocks[field] = values[start:end]
+                spans[field] = (start, end)
+        profiles = blocks.get("learning_profiles") or []
+        if not profiles or any(not (item.get("learning_profile") or {}).get("source_ref") for item in profiles):
+            continue
+        conditions = _pick(facts, ("scope", "phase", "fidelity", "seed", "screening_fold_ids",
+            "screening_subjects", "science_scope"))
+        conditions["evaluation_scope"] = row.get("evaluation_scope")
+        identity = json.dumps([conditions, blocks], sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        groups.setdefault(identity, []).append((index, blocks, spans))
+    shared = {}
+    for matches in groups.values():
+        if len(matches) < 2:
+            continue
+        ref = "baseline_" + str(len(shared) + 1)
+        shared[ref] = copy.deepcopy(matches[0][1])
+        for index, _, spans in matches:
+            facts = result["observations"][index]["native_facts"]
+            for field, (start, end) in spans.items():
+                facts[field][start:end] = [{"control_ref": ref}]
+    if shared:
+        result["shared_reference_results"] = shared
+    return _share_common_facts(result)
+
+
+def _history_navigation(history, observations, previous_observations=(), summary_records=(), priority_ids=()):
+    """Use short navigation for inline bodies, recorded outcomes otherwise."""
+    from .experiment_observations import fit_history_index, observation_summary_index
+
+    if not isinstance(history, dict):
+        return copy.deepcopy(history)
+    detailed = {row.get("observation_id"): row for row in observations if isinstance(row, dict)}
+    previous = {row.get("observation_id"): row for row in previous_observations}
+    summaries = {row["observation_id"]: observation_summary_index(row) for row in summary_records}
+    result = copy.deepcopy(history)
+    frozen_ids = {row.get("observation_id") for row in result.get("items") or [] if isinstance(row, dict)}
+    priority = set(priority_ids)
+    rows = []
+    expanded = False
+    for row in result.get("items") or []:
+        if isinstance(row, dict):
+            identity = row.get("observation_id")
+            if identity in detailed:
+                candidate = row.get("candidate_id") or (detailed[identity].get("identity") or {}).get("candidate_id")
+                row = {"observation_id": identity}
+                if candidate is not None:
+                    row["candidate_id"] = candidate
+            elif identity in priority and set(row) - {"observation_id", "candidate_id"}:
+                # Preserve the supplied basis of an admitted proposal. A new
+                # longer summary must not displace its frozen index evidence.
+                pass
+            elif identity in summaries:
+                row = summaries.pop(identity)
+                expanded = True
+            elif identity in previous and set(row) <= {"observation_id", "candidate_id"}:
+                row = {**observation_summary_index(previous[identity]), **row}
+                expanded = True
+            summaries.pop(identity, None)
+        rows.append(row)
+    if summaries:
+        rows = list(summaries.values()) + rows
+        expanded = True
+    if expanded:
+        rows.sort(key=lambda row: (row.get("observation_id") not in priority,
+            row.get("observation_id") not in frozen_ids if row.get("observation_id") in priority else False,
+            row.get("analysis_delivery") != "summary_only"))
+        return fit_history_index(rows, total=max(result.get("total", len(rows)), len(rows)))
+    result["items"] = rows
+    return result
+
+
 def _v2_knowledge(view):
     if view.get("memory_delivery_report"):
         # The same selected cards were measured with the optional observations.
@@ -169,6 +332,8 @@ def _v2_knowledge(view):
 
 
 def _v2_resources(full):
+    from .context.types import canonical
+
     budget = full.get("budget") or {}
     owner = budget.get("owner_budget") or {}
     # A Planner owner reserves API calls, not a future method's training. Only
@@ -196,8 +361,16 @@ def _v2_resources(full):
             cost["gpu_seconds_estimate"] = copy.deepcopy(estimate["gpu_seconds"])
         cost.update(_pick(body, ("cost_confidence", "cost_scope", "unknown_components")))
         costs[action] = cost
-    if costs:
-        result["native_cost_basis"] = costs
+    grouped = {}
+    for action, cost in costs.items():
+        group = grouped.setdefault(canonical(cost), {"tasks": [], "cost": cost})
+        group["tasks"].append(action)
+    individual = {group["tasks"][0]: group["cost"] for group in grouped.values() if len(group["tasks"]) == 1}
+    shared = [group for group in grouped.values() if len(group["tasks"]) > 1]
+    if individual:
+        result["native_cost_basis"] = individual
+    if shared:
+        result["shared_cost_basis"] = shared
     return result
 
 
@@ -205,6 +378,47 @@ def _v2_task_view(task):
     scope = task.get("evaluation_scope") or {}
     result = _pick(task, ("task_ref", "task_kind", "target_candidate_ref"))
     result.update(_pick(scope, ("phase",)))
+    if scope.get("diagnostic_request"):
+        result["diagnostic_request"] = _pick(scope["diagnostic_request"], ("profile", "population", "outputs"))
+    return result
+
+
+def _reference_training_execution(full, baseline, policy):
+    from .interface import training_batch_partition, training_batch_sizes
+
+    execution = full.get("execution_protocol") or {}
+    devices = execution.get("gpu") or []
+    if not devices:
+        return {}
+    reference = {**execution, **(baseline.get("recipe") or {})}
+    result = {"reference_method": "baseline", "configured_replica_count": len(devices)}
+    if policy in {"data_parallel_local", "global_batch"}:
+        result["objective_execution_scope"] = (
+            "per_replica" if policy == "data_parallel_local" else "full_batch_after_encoder_gather")
+    if reference.get("batch_size") and reference.get("train_query_ids"):
+        first, tail = training_batch_sizes(reference)
+        result["reference_local_batch_sizes"] = training_batch_partition(first, len(devices))
+        if tail != first:
+            result["reference_tail_local_batch_sizes"] = training_batch_partition(tail, len(devices))
+    return result
+
+
+def _planning_decision_rules(goal, execution):
+    result = {}
+    screening_gain = (goal.get("screening") or {}).get("min_mean_gain_pp")
+    if screening_gain is not None:
+        result["screening_decision"] = {"minimum_mean_gain_pp": screening_gain}
+    practical_gain = goal.get("min_practical_gain_pp")
+    if practical_gain is not None and practical_gain != screening_gain:
+        result["min_practical_gain_pp"] = practical_gain
+    policy = execution.get("checkpoint_policy", goal.get("checkpoint_policy"))
+    if policy:
+        selection = {"policy": policy, "metric": "development_fixed_bank_top1", "metric_unit": "fraction"}
+        if policy == "legacy_min_delta":
+            delta = execution.get("selection_min_delta", goal.get("selection_min_delta"))
+            if delta is not None:
+                selection["minimum_gain"] = delta
+        result["checkpoint_selection"] = selection
     return result
 
 
@@ -214,7 +428,7 @@ def _v2_protocol(full, view, baseline):
     recipe = copy.deepcopy(baseline.get("recipe") or {})
     geometry = recipe.pop("input_geometry", None)
     protocol = _pick(goal, ("task_type", "evaluation_mode", "evaluation_schedule", "primary_metric",
-        "direction", "checkpoint_policy", "subject_aggregation", "training_seeds", "frozen_components"))
+        "direction", "subject_aggregation", "training_seeds", "frozen_components"))
     protocol.update(_pick(full.get("frozen_evaluation_scopes") or {}, ("metric_unit",)))
     protocol.update(_pick(interface, ("input", "output", "gallery_size", "not_available")))
     geometry = geometry or _pick(interface, ("c_num", "channels", "timesteps"))
@@ -225,8 +439,14 @@ def _v2_protocol(full, view, baseline):
             if key in recipe:
                 protocol[key] = recipe.pop(key)
         protocol["training_recipe"] = recipe
+        protocol["training_recipe_scope"] = "baseline_reference; candidate settings are selected by Designer and then fixed per method"
+    if interface.get("training_configuration"):
+        protocol["training_configuration"] = copy.deepcopy(interface["training_configuration"])
     if "negative_sampling_policy" not in protocol and baseline.get("negative_sampling_policy"):
         protocol["negative_sampling_policy"] = baseline["negative_sampling_policy"]
+    execution = _reference_training_execution(full, baseline, protocol.get("negative_sampling_policy"))
+    if execution:
+        protocol["training_execution"] = execution
     contract = view.get("contract") or full.get("contract") or {}
     protocol.update(_pick(contract, ("generalization_target", "val_mode", "benchmark_scope", "within_batch_role")))
     scope = copy.deepcopy(view.get("science_scope") or full.get("science_scope") or {})
@@ -234,12 +454,7 @@ def _v2_protocol(full, view, baseline):
         scope["independent_final_test"] = False
     if scope:
         protocol["evidence_scope"] = _v2_science(scope)
-    for source, name in ((goal, "min_practical_gain_pp"), (goal, "selection_min_delta")):
-        if name in source:
-            protocol[name] = copy.deepcopy(source[name])
-    screening = goal.get("screening") or {}
-    if "min_mean_gain_pp" in screening:
-        protocol["screening_min_mean_gain_pp"] = screening["min_mean_gain_pp"]
+    protocol.update(_planning_decision_rules(goal, full.get("execution_protocol") or {}))
     confirmation = goal.get("confirmation") or {}
     protocol.update(_pick(confirmation, ("freeze_method_before_screening",)))
     # Capability behavior is concise and stage-neutral. Implementation signatures,
@@ -257,6 +472,8 @@ def _v2_protocol(full, view, baseline):
     policies = capability.get("negative_sampling_policies") or {}
     alternatives = {name: _pick(body, ("status", "when")) for name, body in policies.items()
                     if name != protocol.get("negative_sampling_policy")}
+    if full.get("evaluation_mode", goal.get("evaluation_mode")) == "loso_method_search":
+        alternatives.pop("global_batch", None)
     if alternatives:
         protocol["other_negative_sampling_policies"] = alternatives
     population = view.get("evaluation_population") or full.get("evaluation_population") or {}
@@ -265,11 +482,14 @@ def _v2_protocol(full, view, baseline):
     counts = _pick(population, ("benchmark_query_count_per_fold", "uniform_gallery_chance_top1"))
     if counts:
         protocol["evaluation_population"] = counts
-    scopes = copy.deepcopy((full.get("frozen_evaluation_scopes") or {}).get("phases") or {})
+    # The frozen task directory owns this round's available settings. The
+    # campaign's final benchmark may contain additional, currently unavailable
+    # phases; those belong to research_goal.final_evaluation, not this menu.
+    scopes = {}
     for task in (full.get("_planning_contract") or {}).get("tasks", []):
         binding = task.get("evaluation_scope") or {}
         phase = binding.get("phase")
-        if phase and phase not in scopes:
+        if phase:
             scopes[phase] = copy.deepcopy(binding)
     if scopes:
         controls = [scope.get("controls") for scope in scopes.values() if scope.get("controls") is not None]
@@ -295,6 +515,23 @@ def _v2_protocol(full, view, baseline):
     return protocol
 
 
+def _final_evaluation(goal, full):
+    """Describe the campaign endpoint without making it this round's scope."""
+    result = _pick(goal, ("subject_aggregation",))
+    if "required_fold_count" in goal:
+        result["fold_count"] = copy.deepcopy(goal["required_fold_count"])
+    if goal.get("benchmark_subjects"):
+        result["subjects"] = copy.deepcopy(goal["benchmark_subjects"])
+    schedule = full.get("evaluation_schedule") or goal.get("evaluation_schedule")
+    phase = "confirmation_10fold" if schedule == "screen_then_confirm" else "full"
+    scope = ((full.get("frozen_evaluation_scopes") or {}).get("phases") or {}).get(phase) or {}
+    if scope.get("folds"):
+        result["fold_count"] = len(scope["folds"])
+    if "fold_count" not in result and "subjects" not in result:
+        return {}
+    return result
+
+
 def _build_v2_proposer_input(full, delivered):
     if delivered.get("planning_context_version") == VERSION_V2:
         return copy.deepcopy(delivered)
@@ -309,6 +546,9 @@ def _build_v2_proposer_input(full, delivered):
     result = {"planning_context_version": VERSION_V2, "planning_stage": "propose",
         "research_goal": _pick(goal, ("objective", "research_scope", "allowed_changes")),
         "protocol": _v2_protocol(full, view, baseline)}
+    final_evaluation = _final_evaluation(goal, full)
+    if final_evaluation:
+        result["research_goal"]["final_evaluation"] = final_evaluation
     result["research_goal"]["target_k"] = ((goal.get("research_execution") or {}).get("target_k", 3))
     from .handoffs import planner_baseline_scientific_source
     method = _pick(baseline, ("intervention", "model", "objective", "transform"))
@@ -349,13 +589,20 @@ def _build_v2_proposer_input(full, delivered):
     else:
         result["task_options"] = [_v2_task_view(task) for task in tasks]
     result["observations"] = _v2_observations(full, view)
+    if any(task.get("task_kind") == "new_method" for task in tasks):
+        from .planning_contract import parent_method_summaries
+        result["available_parent_methods"] = parent_method_summaries(full, baseline, result["observations"])
     history = (view.get("experiment_observations") or {}).get("history_index") if isinstance(view.get("experiment_observations"), dict) else None
     if history:
-        result["history_index"] = copy.deepcopy(history)
-    # Cards have already been scientifically projected and measured. Removing
-    # duplicate conditions here would make the frozen measurement a different
-    # view from the one the Planner and Critic actually receive.
+        result["history_index"] = _history_navigation(history, result["observations"])
+    # Per-observation quotas use complete cards. Reference factoring only
+    # changes their final wire representation, measured by the request compiler.
     result["knowledge"] = _v2_knowledge(view)
+    literature = view.get("literature_memory", full.get("literature_memory"))
+    if literature is not None:
+        # Already selected under its own token allowance. Do not pack it with
+        # empirical history or ask the Planner to repeat it in its response.
+        result["literature_memory"] = copy.deepcopy(literature)
     result["resources"] = _v2_resources(full)
     if any(task.get("task_kind") == "new_method" for task in tasks):
         result["resources"]["new_method_cost_basis"] = (
@@ -368,7 +615,7 @@ def _build_v2_proposer_input(full, delivered):
     for key in ("plan_repair_request", "critic_repair_request", "previous_response_error", "previous_response"):
         if key in view:
             result[key] = copy.deepcopy(view[key])
-    return result
+    return _share_reference_results(result)
 
 
 def build_proposer_input(full: dict, delivered: dict) -> dict:
@@ -390,7 +637,7 @@ def delivered_observation_ids(view: dict) -> frozenset[str]:
 def delivered_observation_rows(view: dict, ids) -> list[dict]:
     """The exact delivered rows for the given IDs, in delivery order."""
     wanted = set(ids)
-    cards = view.get("observations") if view.get("planning_context_version") == VERSION_V2 else view.get("experiment_observations")
+    cards = expanded_observations(view) if view.get("planning_context_version") == VERSION_V2 else view.get("experiment_observations")
     cards = cards or []
     if isinstance(cards, dict):
         cards = [card.get("body") or card for card in cards.get("cards") or []]
@@ -404,10 +651,12 @@ def delivered_observation_rows(view: dict, ids) -> list[dict]:
 
 
 def selection_basis(camp, plan: dict) -> dict | None:
-    """Critic rationale and the delivered history rows behind the selected proposal.
+    """Local provenance for the selected proposal and the Critic's selection.
 
     Rows come from the frozen Planner and Critic snapshots, never a new
     retrieval. Prefer delivered detail over a compact history-index entry.
+    The history union records both stages' cited evidence, not agreement with
+    each other's interpretation. This helper does not supply Designer input.
     """
     import json
     from pathlib import Path
@@ -425,22 +674,34 @@ def selection_basis(camp, plan: dict) -> dict | None:
                               *(round_record.get("selected_basis_observation_ids") or [])]))
     result = {"selection_rationale": round_record.get("selection_rationale"),
               "basis_observation_ids": ids, "basis_observations": delivered_observation_rows(view, ids)}
+    delivered_views = [view]
     critic_path = paths[1].with_name("critic.json")
     if critic_path.is_file():
         critic_view = json.loads(critic_path.read_text(encoding="utf-8")).get("model_input") or {}
+        delivered_views.append(critic_view)
         rows = delivered_observation_rows(critic_view, ids) + result["basis_observations"]
         # Detail in either frozen input takes precedence over index-only facts.
         detail_ids = {row.get("observation_id") for source in (view, critic_view)
                       for row in source.get("observations") or []}
         indexed = {}
         for source in (view, critic_view):
-            for row in source.get("observations") or []:
+            for row in expanded_observations(source):
                 if row.get("observation_id") in ids:
                     indexed[row["observation_id"]] = copy.deepcopy(row)
         for row in rows:
             if row["observation_id"] not in detail_ids:
                 indexed.setdefault(row["observation_id"], row)
         result["basis_observations"] = [indexed[identity] for identity in ids if identity in indexed]
+    cited_refs = set(proposal.get("required_context_refs") or [])
+    literature = {}
+    for delivered in delivered_views:
+        for card in (delivered.get("literature_memory") or {}).get("items") or []:
+            reference = card.get("source_ref")
+            if reference in cited_refs:
+                literature.setdefault(reference, copy.deepcopy(card))
+    if literature:
+        # Retain only the selected method's cited findings for local provenance.
+        result["basis_literature"] = list(literature.values())
     selected_id = plan.get("originating_proposal") or proposal.get("proposal_id")
     selected = next((row for row in round_record.get("evaluations") or []
                      if row.get("proposal_id") == selected_id), None)
@@ -475,10 +736,6 @@ def _critic_v2_cost(value):
                  if key not in {"implementation_risk", "implementation"}}
     if any(item is not None for item in predicted.values()):
         result["predicted"] = predicted
-    # An allocation maximum remains distinct from a cost estimate. It can
-    # affect feasibility even when the candidate's runtime is unknown.
-    if "runtime_allocation_bound" in value:
-        result["runtime_allocation_bound"] = copy.deepcopy(value["runtime_allocation_bound"])
     return result
 
 
@@ -490,12 +747,14 @@ def _critic_v2_comparison(pool, full, critic_context):
     for native in pool["proposals"]:
         proposal_id = native["proposal_id"]
         rows.append({"proposal_ref": aliases[proposal_id],
+            "parent_ref": copy.deepcopy(native.get("parent_ref")),
             "question": copy.deepcopy(native["question"]),
             "method": copy.deepcopy(native["task_description"]),
             "rationale": copy.deepcopy(native["scientific_intent"]),
             "expected_observation": copy.deepcopy(native["expected_observation"]),
             "implementation_risk": copy.deepcopy(native.get("implementation_risk")),
             "basis_observation_ids": copy.deepcopy(native.get("basis_observation_ids") or []),
+            "comparison_observation_ids": copy.deepcopy(native.get("comparison_observation_ids") or []),
             "required_context_refs": copy.deepcopy(native.get("required_context_refs") or [])})
         if "related_observation_ids_by_proposal" in context:
             rows[-1]["related_observation_ids"] = copy.deepcopy(context["related_observation_ids_by_proposal"].get(proposal_id, []))
@@ -539,10 +798,22 @@ def build_critic_input(full: dict, delivered: dict, native_pool: dict,
         raise ValueError("critic_delivered_observations_changed")
     result = {"planning_context_version": VERSION_V2, "planning_stage": "critic"}
     result.update({key: copy.deepcopy(delivered[key]) for key in required})
+    if "shared_reference_results" in delivered:
+        result["shared_reference_results"] = copy.deepcopy(delivered["shared_reference_results"])
+    if "shared_facts" in delivered:
+        result["shared_facts"] = copy.deepcopy(delivered["shared_facts"])
+    parents = {proposal.get("parent_ref") for proposal in native_pool["proposals"]}
+    parent_methods = [copy.deepcopy(row) for row in delivered.get("available_parent_methods") or []
+                      if row.get("parent_ref") in parents and len(row) > 1]
+    if parent_methods:
+        result["available_parent_methods"] = parent_methods
+    if "literature_memory" in delivered:
+        result["literature_memory"] = copy.deepcopy(delivered["literature_memory"])
     if "history_index" in delivered:
-        result["history_index"] = copy.deepcopy(delivered["history_index"])
+        result["history_index"] = _history_navigation(delivered["history_index"], result["observations"])
     result["research_goal"].pop("target_k", None)
     result["resources"].pop("native_cost_basis", None)
+    result["resources"].pop("shared_cost_basis", None)
     result["comparison"] = critic_pool_input(native_pool, full, critic_context=context)
     return result
 
@@ -554,16 +825,21 @@ def prepare_critic_science(camp, full: dict, proposer_input: dict, pool: dict) -
     from .memory_delivery import project_memory_card, select_memory_cards
     from .semantic_memory import retrieve_proposal_observations
 
-    view = copy.deepcopy(proposer_input)
+    view = _expand_shared_facts(proposer_input, proposer_input.get("shared_facts") or {})
+    view.pop("shared_facts", None)
     config = memory_config(camp)
-    if not config.enabled:
-        return view
+    previous_observations = expanded_observations(view)
     bundle = retrieve_proposal_observations(camp, pool["proposals"],
-        context=planner_applicability_context(camp, full))
+        context=planner_applicability_context(camp, full),
+        delivered_observations={row["observation_id"]: row for row in previous_observations})
     if bundle["status"] in {"disabled", "empty"}:
-        return view
+        return copy.deepcopy(proposer_input)
+    view["observations"] = previous_observations
+    view.pop("shared_reference_results", None)
     lists = [bundle["by_proposal"][row["proposal_id"]] for row in pool["proposals"]]
-    cited_ids = {identity for proposal in pool["proposals"] for identity in proposal.get("basis_observation_ids") or []}
+    cited_ids = {identity for proposal in pool["proposals"]
+                 for field in ("basis_observation_ids", "comparison_observation_ids")
+                 for identity in proposal.get(field) or []}
     cited_refs = {reference for proposal in pool["proposals"] for reference in proposal.get("required_context_refs") or []}
     def referenced(value):
         if isinstance(value, str):
@@ -573,42 +849,60 @@ def prepare_critic_science(camp, full: dict, proposer_input: dict, pool: dict) -
         if isinstance(value, list):
             return any(referenced(child) for child in value)
         return False
+    priority_ids = set(cited_ids)
+    priority_ids.update(identity for identities in bundle.get("priority_ids_by_proposal", {}).values()
+                        for identity in identities)
     current, cited = [], []
     for row in view["observations"]:
         card = {"record_type": "experiment_observation", "record_id": row["observation_id"], "body": row,
                 "current_feedback": row.get("current_feedback", False)}
         if row.get("current_feedback"):
             current.append(card)
-        elif row["observation_id"] in cited_ids or referenced(row):
+        elif row["observation_id"] in priority_ids or referenced(row):
             cited.append(card)
-    knowledge = list((view.get("knowledge") or {}).get("items") or [])
-    cited.extend(card for card in knowledge if referenced(card))
-    knowledge = [card for card in knowledge if not referenced(card)]
     # Round-robin relevance avoids filling every related slot from p1 alone.
-    related = [project_memory_card(rows[index], role="research_planner")
-               for index in range(max((len(rows) for rows in lists), default=0))
-               for rows in lists if index < len(rows)]
+    related, seen_related = [], set()
+    for index in range(max((len(rows) for rows in lists), default=0)):
+        for rows in lists:
+            if index < len(rows) and rows[index]["record_id"] not in seen_related:
+                record = rows[index]
+                seen_related.add(record["record_id"])
+                related.append(project_memory_card(record, role="research_planner"))
+    # Explicit index-only citations and parent diagnostics may not have been
+    # among the Planner's detailed cards. Retrieval resolves them once by ID.
+    frozen_ids = {row["observation_id"] for row in previous_observations}
+    cited.extend(card for card in related if card["record_id"] in priority_ids
+                 and card["record_id"] not in frozen_ids)
     # Admitted proposals already cite this frozen science. New retrieval must
     # not displace it and leave dangling basis IDs or required references.
-    cards = current + cited + related + knowledge
+    # Knowledge was selected for the Planner already, and this retrieval adds
+    # observations only. Its separate allocation and frozen body stay unchanged.
+    cards = current + cited + related
     selected = select_memory_cards(cards, content_chars_budget=config.content_chars_budget,
                                   per_observation_tokens_budget=config.per_observation_tokens_budget)
-    cited_count = sum(card["record_type"] == "experiment_observation" for card in cited)
+    cited_count = len({card["record_id"] for card in cited if card["record_type"] == "experiment_observation"})
     related_limit = max(max(0, min(config.top_k, 32)), cited_count)
-    observations, other, optional_count = [], [], 0
+    observations, optional_count = [], 0
     for card in selected.cards:
-        if card["record_type"] != "experiment_observation":
-            other.append(card)
-        elif card.get("current_feedback") or optional_count < related_limit:
+        if card.get("current_feedback") or optional_count < related_limit:
             observations.append(card)
             optional_count += not bool(card.get("current_feedback"))
     view["observations"] = _v2_observations(full, {"experiment_observations": {"cards":
         observations}})
-    knowledge = [card for card in other if card["record_type"] in {"lesson", "knowledge"}]
-    view["knowledge"] = {"status": "ready" if knowledge else "no_related_knowledge", "items": knowledge}
+    frozen_by_id = {row["observation_id"]: row for row in previous_observations}
+    view["observations"] = [copy.deepcopy(frozen_by_id[row["observation_id"]])
+                            if row["observation_id"] in frozen_by_id else row for row in view["observations"]]
+    overflow_ids = {row["record_id"] for row in selected.report["omitted"]
+                    if row["record_type"] == "experiment_observation"
+                    and row["reason"] == "per_observation_tokens_budget"}
+    if "history_index" in view or overflow_ids:
+        view["history_index"] = _history_navigation(view.get("history_index", {}),
+            view["observations"], previous_observations,
+            summary_records=[card["body"] for card in cards if card["record_id"] in overflow_ids],
+            priority_ids=priority_ids)
     delivered = delivered_observation_ids(view)
     view["related_observation_ids_by_proposal"] = {pid: [row["record_id"] for row in rows
         if row["record_id"] in delivered] for pid, rows in bundle["by_proposal"].items()}
-    return view
+    return _share_reference_results(view)
 
 
