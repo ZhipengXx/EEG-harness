@@ -1,10 +1,16 @@
-![EEGagent — from brain signals to testable ideas.](docs/figures/00-brain-decoding-hero.png)
+# EEG-harness
 
-**Agent-guided research for brain decoding.**
+![EEG-harness — from research questions to measured evidence.](docs/figures/00-brain-decoding-hero.png)
 
-EEGagent connects a decoding question to a controlled experiment: choose what to test, implement a candidate, compare it with a control, and use the result to decide what comes next. Its primary workflow is code-level EEG / MEG image-retrieval research. A second workflow screens predicted fMRI responses.
+**An agent harness for iterative brain-decoding research.**
 
-**Plan over alternatives.** New `single_plan_v1` campaigns ask the Planner for **2–4 distinct plans**, then an independent Critic compares the valid pool and selects one for the Designer. The runtime validates the selection before dispatch; explicit `combined` mode keeps proposal and selection in one call.
+EEG-harness turns a research question into a sequence of EEG / MEG image-retrieval experiments. It coordinates planning, method design, coding and review, GPU training, result analysis, and memory, so that each round can build on measured results and relevant literature.
+
+The harness manages the experiment state, data protocol, role-specific context, execution and recovery. Models propose and interpret the research; local code supplies measured results and connects each decision to its experiment. A second workflow screens predicted fMRI responses.
+
+**The research loop:** a Planner proposes **2–4 alternatives** → an independent Critic selects one → the Designer specifies the experiment → the Coder and Reviewer prepare its implementation → GPU workers train and evaluate → Analysis and Memory inform the next round.
+
+**Two sources of memory:** optional paper memory stores findings from retrieved literature; experiment memory stores observations and lessons from completed runs. Planner and Critic retrieve relevant evidence, while later stages receive the context needed for the selected task.
 
 <p align="left">
   <a href="#inside-the-workbench"><img src="docs/figures/navigation/workbench.svg" width="146" height="44" alt="Workbench"></a>
@@ -43,7 +49,7 @@ The curves follow each job's recorded history. A falling loss is a training diag
 
 A retrieval score tells you how a decoder performed. The next experiment asks why: did an encoder change help, does the comparison hold under the same protocol, and what evidence would distinguish the proposed explanation from an alternative?
 
-EEGagent keeps that question connected to the code and the result. A campaign records the hypothesis, candidate implementation, control, diagnostics and next decision. The useful outcome can be an improved candidate, a negative result, or a clearer reason to stop.
+EEG-harness keeps that question connected to the code and the result. A campaign records the hypothesis, candidate implementation, control, diagnostics and next decision. The useful outcome can be an improved candidate, a negative result, or a clearer reason to stop.
 
 | If you have… | Start with… | You get… |
 | --- | --- | --- |
@@ -107,8 +113,8 @@ The report retains **`claim_scope=numeric_consistency_only`**, together with a v
 Use Python **3.11+** and `uv`:
 
 ```bash
-git clone https://github.com/ZhipengXx/EEGagent.git
-cd EEGagent/react-agent
+git clone https://github.com/ZhipengXx/EEG-harness.git
+cd EEG-harness/react-agent
 uv sync --group dev
 cp .env.example .env
 ```
@@ -152,7 +158,7 @@ uv run python -m react_agent.eeg_research.agentic.cli start \
 | Area | Current scope |
 | --- | --- |
 | Decoding task | EEG / MEG **image retrieval** from preprocessed signals; classification, image reconstruction, raw preprocessing and foundation-model adapters are unavailable |
-| Method evidence | Bundled local method cards; online literature retrieval is not implemented |
+| Method evidence | Bundled local method cards and optional paper retrieval through GPT Researcher with DeepSeek extraction; paper memory and experiment memory have separate stores and retrieval budgets |
 | Role models | Eight base EEG roles plus the independent Critic; model, thinking/effort, output budgets and wall-clock deadlines are configured per role |
 | Planning and evidence reads | `single_plan_v1` campaigns use `propose_then_critic`: a batch of plans, one Critic comparison and one selected plan; legacy next-action planning retains `compare_options` |
 | Result audit | Structured report and dependency context, identity / freshness checks and tracked corrections; same-provider review does not establish independent replication |

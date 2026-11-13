@@ -1,6 +1,6 @@
-# EEGagent runtime
+# EEG-harness runtime
 
-This directory contains EEGagent's fMRI screening workflow, EEG / MEG retrieval research runtime, training worker and local workbench.
+This directory contains the EEG-harness runtime for iterative EEG / MEG image-retrieval research: planning and Critic selection, experiment design, coding and review, GPU execution, analysis, and memory. It also includes the fMRI screening workflow and local workbench.
 
 Start with the [project README](../README.md) for the research story and collaboration figures. The [running guide](../docs/running.md) collects setup and workflow commands; the [architecture map](../docs/architecture.md) connects the figures to the current implementation.
 

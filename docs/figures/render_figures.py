@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render EEGagent's editable, data-free README illustrations.
+"""Render EEG-harness's editable, data-free README illustrations.
 
 Run from any directory with Python 3 and Inkscape installed. No model, API,
 training data, or third-party Python package is required.
@@ -69,7 +69,7 @@ class Figure:
         self.path(f'M{x1} {y} H{x2}', color, 1)
 
     def header(self, index, title, subtitle):
-        self.text(54, 47, "EEGagent  /  BRAIN DECODING RESEARCH", 16, MUTED, spacing=2)
+        self.text(54, 47, "EEG-harness  /  BRAIN DECODING RESEARCH", 16, MUTED, spacing=2)
         self.text(1385, 47, index, 18, RUST, font=MONO, anchor="end")
         self.text(54, 109, title, 43, font=SERIF)
         self.text(54, 150, subtitle, 23, MUTED)
@@ -148,15 +148,15 @@ def gallery(f, x, y, width=63, rows=1, highlight=True):
 
 
 def hero():
-    f = Figure('00-brain-decoding-hero', 670, 'EEGagent: from brain signals to testable ideas',
+    f = Figure('00-brain-decoding-hero', 670, 'EEG-harness: from research questions to measured evidence',
                'Editorial illustration of EEG signals, learned representations and image-gallery retrieval. '
                'The brain and signal traces are conceptual drawings, not recorded data or reconstruction results.')
-    f.text(54, 53, 'BRAIN DECODING  /  AN EXPERIMENTAL WORKBENCH', 18, MUTED, spacing=2)
+    f.text(54, 53, 'BRAIN DECODING  /  AN AGENT RESEARCH HARNESS', 18, MUTED, spacing=2)
     f.rule(54, 76, 1386)
-    f.text(50, 210, 'EEGagent', 108, font=SERIF)
-    f.text(58, 274, 'From brain signals', 37, font=SERIF)
-    f.text(58, 324, 'to testable ideas.', 37, font=SERIF)
-    f.text(58, 376, 'Plan the experiment. Read the evidence. Decide what comes next.', 23, MUTED)
+    f.text(50, 210, 'EEG-harness', 108, font=SERIF)
+    f.text(58, 274, 'From research questions', 37, font=SERIF)
+    f.text(58, 324, 'to measured evidence.', 37, font=SERIF)
+    f.text(58, 376, 'Plan. Implement. Experiment. Learn from the evidence.', 23, MUTED)
     brain(f, 1053, 119, 1.38, electrodes=True)
     traces(f, 965, 365, 364, rows=1, amp=16)
     f.text(1340, 412, 'Neural signals, drawn schematically', 17, MUTED, anchor='end')

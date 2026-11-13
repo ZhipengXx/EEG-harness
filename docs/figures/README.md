@@ -1,4 +1,4 @@
-# EEGagent visual system
+# EEG-harness visual system
 
 The README uses an editorial scientific style: warm paper, ink-blue typography, restrained copper and teal accents, thin rules and generous margins. Brain signals, cortical folds, representations and image-gallery glyphs tie the illustrations to brain decoding.
 
@@ -56,7 +56,7 @@ The planning comparison figure uses the same drawing primitives and can be regen
 python docs/figures/render_planning_options.py
 ```
 
-Its four actions and highlighted selection are illustrative. One planner response contains the alternatives and choice; the runtime dispatches the selected action after validation.
+Its four proposals and highlighted selection are illustrative. One Planner response supplies the alternatives; an independent Critic compares them and selects one plan. In the illustrated experiment task, that plan goes to the Designer.
 
 To export a manually edited SVG:
 

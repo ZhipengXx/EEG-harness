@@ -1,8 +1,8 @@
 # The research workbench
 
-EEGagent opens on autonomous code-level research. A study connects a question, candidate implementation, training job and recorded decision. The workbench makes those records inspectable through process, experiment and code / artifact views.
+EEG-harness opens on autonomous code-level research. A study connects a question, candidate implementation, training job and recorded decision. The workbench makes those records inspectable through process, experiment and code / artifact views.
 
-Current source baseline: [`09dc98f`](https://github.com/ZhipengXx/EEGagent/tree/09dc98f83e8e4aa944245cfeb661d87e4af2e170). Screenshot baseline: [`14ec3e6`](https://github.com/ZhipengXx/EEGagent/commit/14ec3e6), committed on 2026-10-01 (UTC+08:00). The original images are application captures from that revision, using synthetic DEMO data. The English process image is a text-localized edit for documentation, not an unedited browser capture. No application view was recaptured for this README update. Subsequent UI changes, including `29fbeed`, are not shown in these images.
+Current source baseline: [`09dc98f`](https://github.com/ZhipengXx/EEG-harness/tree/09dc98f83e8e4aa944245cfeb661d87e4af2e170). Screenshot baseline: [`14ec3e6`](https://github.com/ZhipengXx/EEG-harness/commit/14ec3e6), committed on 2026-10-01 (UTC+08:00). The original images are application captures from that revision, using synthetic DEMO data. The English process image is a text-localized edit for documentation, not an unedited browser capture. No application view was recaptured for this README update. Subsequent UI changes, including `29fbeed`, are not shown in these images.
 
 ## Recorded desktop views
 

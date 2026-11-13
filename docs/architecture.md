@@ -1,6 +1,6 @@
 # Architecture and source map
 
-Inspection baseline: [`09dc98f83e8e4aa944245cfeb661d87e4af2e170`](https://github.com/ZhipengXx/EEGagent/tree/09dc98f83e8e4aa944245cfeb661d87e4af2e170), committed on 2026-10-04 (UTC+08:00). This map includes next-action comparisons, verified artifact reads, bound audit feedback and execution recovery. See the [running guide](running.md) for setup and the [platform gallery](platform.md) for recorded UI images.
+Inspection baseline: [`09dc98f83e8e4aa944245cfeb661d87e4af2e170`](https://github.com/ZhipengXx/EEG-harness/tree/09dc98f83e8e4aa944245cfeb661d87e4af2e170), committed on 2026-10-04 (UTC+08:00). This map includes next-action comparisons, verified artifact reads, bound audit feedback and execution recovery. See the [running guide](running.md) for setup and the [platform gallery](platform.md) for recorded UI images.
 
 ## Reading the figures
 

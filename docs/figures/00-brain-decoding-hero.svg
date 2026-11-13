@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1440" height="670" viewBox="0 0 1440 670" role="img" aria-labelledby="title desc">
-<title id="title">EEGagent: from brain signals to testable ideas</title>
+<title id="title">EEG-harness: from research questions to measured evidence</title>
 <desc id="desc">Editorial illustration of EEG signals, learned representations and image-gallery retrieval. The brain and signal traces are conceptual drawings, not recorded data or reconstruction results.</desc>
 <defs>
 <marker id="arrow-ink" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0 L8 4 L0 8" fill="#203744"/></marker>
@@ -7,12 +7,12 @@
 <marker id="arrow-rust" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0 L8 4 L0 8" fill="#AE663B"/></marker>
 </defs>
 <rect width="1440" height="670" fill="#F7F4EE"/>
-<text x="54" y="53" fill="#5C6C70" font-family="DejaVu Sans" font-size="18" font-weight="normal" text-anchor="start" letter-spacing="2">BRAIN DECODING  /  AN EXPERIMENTAL WORKBENCH</text>
+<text x="54" y="53" fill="#5C6C70" font-family="DejaVu Sans" font-size="18" font-weight="normal" text-anchor="start" letter-spacing="2">BRAIN DECODING  /  AN AGENT RESEARCH HARNESS</text>
 <path d="M54 76 H1386" fill="none" stroke="#CCCFC7" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
-<text x="50" y="210" fill="#203744" font-family="DejaVu Serif" font-size="108" font-weight="normal" text-anchor="start" letter-spacing="0">EEGagent</text>
-<text x="58" y="274" fill="#203744" font-family="DejaVu Serif" font-size="37" font-weight="normal" text-anchor="start" letter-spacing="0">From brain signals</text>
-<text x="58" y="324" fill="#203744" font-family="DejaVu Serif" font-size="37" font-weight="normal" text-anchor="start" letter-spacing="0">to testable ideas.</text>
-<text x="58" y="376" fill="#5C6C70" font-family="DejaVu Sans" font-size="23" font-weight="normal" text-anchor="start" letter-spacing="0">Plan the experiment. Read the evidence. Decide what comes next.</text>
+<text x="50" y="210" fill="#203744" font-family="DejaVu Serif" font-size="108" font-weight="normal" text-anchor="start" letter-spacing="0">EEG-harness</text>
+<text x="58" y="274" fill="#203744" font-family="DejaVu Serif" font-size="37" font-weight="normal" text-anchor="start" letter-spacing="0">From research questions</text>
+<text x="58" y="324" fill="#203744" font-family="DejaVu Serif" font-size="37" font-weight="normal" text-anchor="start" letter-spacing="0">to measured evidence.</text>
+<text x="58" y="376" fill="#5C6C70" font-family="DejaVu Sans" font-size="23" font-weight="normal" text-anchor="start" letter-spacing="0">Plan. Implement. Experiment. Learn from the evidence.</text>
 <g transform="translate(1053 119) scale(1.38)">
 <path d="M22 111 C2 90 8 54 30 43 C32 20 57 10 78 17 C96 0 126 5 139 18 C165 10 190 24 193 47 C220 58 224 90 209 107 C211 134 182 151 157 146 L136 151 C117 155 108 138 111 124 C90 132 71 125 57 127 C39 130 27 122 22 111 Z" fill="#EBEEE5" stroke="#203744" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
 <path d="M32 48 C58 31 73 47 71 67 C67 84 43 73 43 94 C43 109 62 114 77 103" fill="none" stroke="#35756E" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" opacity="0.65"/>

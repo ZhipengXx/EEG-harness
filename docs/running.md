@@ -1,4 +1,4 @@
-# Running EEGagent
+# Running EEG-harness
 
 Start with the [project README](../README.md) for the research workflows. This guide collects setup, commands, configuration and the current execution boundaries.
 
@@ -7,8 +7,8 @@ Start with the [project README](../README.md) for the research workflows. This g
 Use Python **3.11 or newer** and `uv`. From a fresh checkout:
 
 ```bash
-git clone https://github.com/ZhipengXx/EEGagent.git
-cd EEGagent/react-agent
+git clone https://github.com/ZhipengXx/EEG-harness.git
+cd EEG-harness/react-agent
 uv sync --group dev
 cp .env.example .env
 ```
